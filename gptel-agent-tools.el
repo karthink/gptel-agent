@@ -1031,8 +1031,8 @@ Should include exactly what information the agent should return."))
   (when-let* ((info (gptel-fsm-info fsm))
               (info-ov (plist-get info :context))
               (count (overlay-get info-ov 'count)))
-    (run-with-idle-timer
-     1.0 nil
+    (run-at-time
+     1.5 nil
      (lambda (ov count)
        (when (and (overlay-buffer ov)
                   (eql (overlay-get ov 'count) count))
