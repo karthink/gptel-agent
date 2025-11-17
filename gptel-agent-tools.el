@@ -1538,8 +1538,7 @@ Files over 512 KB in size can only be read by specifying a line range."
  :function #'gptel-agent--read-file-lines
  :args '(( :name "file_path"
            :type string
-           :description "The path to the file to be read."
-           :type string)
+           :description "The path to the file to be read.")
          ( :name "start_line"
            :type integer
            :description "The line to start reading from, defaults to the start of the file"
