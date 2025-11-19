@@ -900,7 +900,7 @@ Please specify a line range to read")
                 (delete-region (point) (point-max))
               (if (>= byte-offset file-size)
                   (cl-return)
-                (insert-file-contents-literally
+                (insert-file-contents
                  filename nil byte-offset (+ byte-offset chunk-size))
                 (setq byte-offset (+ byte-offset chunk-size))))))
 
