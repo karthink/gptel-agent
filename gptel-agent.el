@@ -372,8 +372,9 @@ this session, which defaults to the default `gptel-agent'."
   (interactive
    (list (if current-prefix-arg
              (funcall project-prompter)
-           (or (project-root (project-current))
-               default-directory))
+           (if-let ((proj (project-current)))
+               (project-root proj)
+             default-directory))
          'gptel-agent))
   (let ((gptel-buf
          (gptel (generate-new-buffer-name
