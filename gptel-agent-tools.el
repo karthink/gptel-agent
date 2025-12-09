@@ -1454,7 +1454,8 @@ specific location with no changes to the surrounding context."
 - -1 to insert at the end."
            :type integer)
          ( :name "new_str"
-           :description "String to insert at `line_number`."))
+           :description "String to insert at `line_number`."
+           :type string))
  :category "gptel-agent"
  :confirm t
  :include t)
