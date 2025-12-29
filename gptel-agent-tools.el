@@ -1215,18 +1215,34 @@ Error details: %S"
 
 ;;; All tool declarations
 
+(defun gptel-agent--execute-bash (callback command)
+  "Execute COMMAND asynchronously in bash and call CALLBACK with output.
+
+CALLBACK is called with the command output string when the process finishes.
+COMMAND is the bash command string to execute."
+  (let* ((output-buffer (generate-new-buffer " *gptel-agent-bash*"))
+         (proc (make-process
+                :name "gptel-agent-bash"
+                :buffer output-buffer
+                :command (list "bash" "-c" command)
+                :connection-type 'pipe
+                :sentinel
+                (lambda (process _event)
+                  (when (memq (process-status process) '(exit signal))
+                    (let* ((exit-code (process-exit-status process))
+                           (output (with-current-buffer (process-buffer process)
+                                     (buffer-string))))
+                      (kill-buffer (process-buffer process))
+                      (funcall callback
+                               (if (zerop exit-code)
+                                   output
+                                 (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s"
+                                         exit-code output)))))))))
+    proc))
+
 (gptel-make-tool
  :name "Bash"
- :function (lambda (command)
-             "Execute a bash command and return its output.
-
-COMMAND is the bash command string to execute."
-             (with-temp-buffer
-               (let* ((exit-code (call-process "bash" nil (current-buffer) nil "-c" command))
-                      (output (buffer-string)))
-                 (if (zerop exit-code)
-                     output
-                   (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s" exit-code output)))))
+ :function #'gptel-agent--execute-bash
  :description "Execute Bash commands.
 
 This tool provides access to a Bash shell with GNU coreutils (or equivalents) available.
@@ -1257,7 +1273,8 @@ Can include pipes and standard shell operators.
 Example: 'ls -la | head -20' or 'grep -i error app.log | tail -50'"))
  :category "gptel-agent"
  :confirm t
- :include t)
+ :include t
+ :async t)
 
 (gptel-make-tool
  :name "Eval"
