@@ -335,6 +335,8 @@ Signals an error if:
                    (value (cdr pair)))
 
               (pcase key-sym
+                (:context (setq value (split-string value))))
+              (pcase key-sym
                 (:tools (setq value (split-string value))))
 
               ;; Skip CATEGORY property (added automatically by Org)
