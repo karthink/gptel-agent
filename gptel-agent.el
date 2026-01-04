@@ -334,9 +334,9 @@ Signals an error if:
                    (key-sym (intern (concat ":" key-str)))
                    (value (cdr pair)))
 
+
               (pcase key-sym
-                (:context (setq value (split-string value))))
-              (pcase key-sym
+                (:context (setq value (split-string value)))
                 (:tools (setq value (split-string value))))
 
               ;; Skip CATEGORY property (added automatically by Org)
