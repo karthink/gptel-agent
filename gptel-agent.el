@@ -116,9 +116,13 @@ any templates to the system prompt."
 ;;;###autoload
 (defun gptel-agent-update ()
   "Update agent definitions from `gptel-agent-dirs'."
+  ;; Load skills to be included in the system message
+  (gptel-agent--skills-update)
+
   ;; First pass: discover all agents and collect their file paths
   (setq gptel-agent--agents nil)
-  (let ((agent-files nil))              ; Alist of (agent-name . file-path)
+  (let ((agent-files nil)               ; Alist of (agent-name . file-path)
+        (skills-str (gptel-agent--skills-system-message)))
     (mapc (lambda (dir)
             (dolist (agent-file (cl-delete-if-not #'file-regular-p
                                                   (directory-files dir 'full)))
@@ -144,7 +148,9 @@ any templates to the system prompt."
                        into agent-list
                        finally return (apply #'concat agent-list)))
              ;; Create templates alist
-             (templates (list (cons "AGENTS" agents-list-str))))
+             (templates (list
+                         (cons "AGENTS" agents-list-str)
+                         (cons "SKILLS" skills-str))))
         (when agent-file                ; Parse the agent file with templates
           (setf (alist-get name gptel-agent--agents nil t #'equal)
                 (cdr (gptel-agent-read-file agent-file templates)))))))

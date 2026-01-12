@@ -47,6 +47,13 @@
 (require 'url-http)
 (eval-when-compile (require 'cl-lib))
 
+(defcustom gptel-agent-skills-dirs nil
+  "Directories holding local skills.
+Each directory location listed here is expected to agentskill
+definition. An agentskill is a directory with atleast one file named
+\"SKILL.md\".
+See https://agentskills.io for more details on agentskills.")
+
 (declare-function org-escape-code-in-region "org-src")
 
 (defvar url-http-end-of-headers)
@@ -1179,6 +1186,81 @@ Exactly one item should have status \"in_progress\"."
                                       'face 'font-lock-escape-face))))))))
   t)
 
+;;; Agentskill tool
+(defvar gptel-agent--known-skills nil
+  "Known skills alist.
+
+The key is the name. The value is a cons (LOCATION . SKILL-PLIST).
+LOCATION is path to the skill's directory. SKILL-PLIST is the header
+of the corresponding SKILL.md as a plist.")
+
+(defun gptel-agent--skills-update ()
+  "Update the known skills list from `gptel-agent-skills-dirs'."
+  (setq gptel-agent--known-skills nil)
+  (mapcar (lambda (dir)
+            (dolist (skill-file (directory-files-recursively dir "SKILL\.md"))
+              (pcase-let ((`(,name . ,skill-plist)
+                           (gptel-agent-read-file skill-file)))
+                ;; validating skill definition
+                (if (plist-get skill-plist :description)
+                    (setf (alist-get name gptel-agent--known-skills nil nil #'string-equal)
+                          (cons (file-name-directory skill-file) skill-plist))
+                  (warn "Skill %s (at %s) does not have a description. Ignoring %s skill." name skill-file name)))))
+          gptel-agent-skills-dirs)
+  gptel-agent--known-skills)
+
+(defun gptel-agent--skills-system-message ()
+  "Returns the message describing the list of known skills."
+  ;; Copied from opencode (https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/skill.ts)
+  (concat "Load a skill to get detailed instructions for a specific task."
+          "Skills provide specialized knowledge and step-by-step guidance."
+          "Use this when a task matches an available skill's description."
+          "\n<available_skills>\n"
+          (mapconcat (lambda (skill-def)
+                       (format "  <skill>
+    <name>%s</name>
+    <description>%s</description>
+  </skill>"
+                               (car skill-def)
+                               (plist-get (cddr skill-def) :description)))
+                     gptel-agent--known-skills "\n")
+          "\n</available_skills>"))
+
+(defun gptel-agent--get-skill (skill &optional _args)
+  "Return the details of the SKILL.
+
+This loads the body of the corresponding SKILL.
+When using this as a tool in gptel, make sure the known skills are
+added to the context window. `gptel-agent--skills-system-message' can
+be used to generate the known skills a string ready to be included to
+the context."
+  (pcase-let ((`(,skill-dir . ,skill-plist) (alist-get skill gptel-agent--known-skills nil nil #'string-equal)))
+    (if (not skill-dir)
+        (format "Error: skill %s not found." skill)
+      (let* ((skill-dir-expanded (expand-file-name skill-dir))
+             (skill-files (mapcar (lambda (full-path)
+                                    (cons (file-relative-name full-path skill-dir-expanded) full-path))
+                                  (directory-files-recursively skill-dir-expanded "[^SKILL\.md]")))
+             (body (plist-get
+                    (cdr (gptel-agent-read-file
+                          (expand-file-name "SKILL.md" skill-dir)
+                          ;; KLUDGE: forcing the full content
+                          '(("---noop---"))))
+                    :system)))
+        (if body
+            (let (start)
+              (with-temp-buffer
+                (insert "## Skill: " skill
+                        "\n- base dir: " skill-dir-expanded "\n")
+                (setq start (point))
+                (insert body)
+                (pcase-dolist (`(,rel-path . ,full-path) skill-files)
+                  (goto-char start)
+                  (while (search-forward-regexp (regexp-quote rel-path) nil t)
+                    (replace-match full-path t t)))
+                (buffer-string)))
+          (format "Could not load body of skill %s" skill))))))
+
 ;;; Task tool (sub-agent)
 (defvar gptel-agent-request--handlers
   `((WAIT ,#'gptel-agent--indicate-wait
@@ -1703,6 +1785,37 @@ Only one todo can be `in_progress` at a time."
         ( :type string :minLength 1
           :description "Present continuous form shown during execution (e.g., 'Running tests')")))))
  :category "gptel-agent")
+
+(gptel-make-tool
+ :name "Skill"
+ :description "Load a skill into the current conversation.
+
+Each skill provides guidance on how to execute a specific task.
+You can invoke a skill with optional args, the args are for your future reference only. 
+
+When to use:
+- When a skill is relevant, you must invoke this tool IMMEDIATELY
+- This is a BLOCKING REQUIREMENT: invoke the relevant Skill tool before generating any other response about the task
+- Only use skills listed in your prompt
+- Do not invoke a skill that is already loaded.
+
+How to use:
+- Invoke with the skill name and optional args.  THe args are for your reference only
+- Examples:
+    - `skill: \"pdf\"` - invoke the pdf skill
+    - `skill: \"commit\", args: \"-m 'Fix bug'\"` - invoke with arguments  
+    - `skill: \"review-pr\", args: \"123\"` - invoke with arguments"
+ :function #'gptel-agent--get-skill
+ :args '(( :name "skill"
+           :type string
+           :description "Name of the skill, chosen from the list of available skills")
+         ( :name "args"
+           :type string
+           :optional t
+           :description "Args relevant to the skill, for your future reference"))
+ :category "gptel-agent"
+ :confirm t
+ :include t)
 
 (gptel-make-tool
  :name "Agent"
