@@ -1496,6 +1496,7 @@ Consider using the more granular tools \"Insert\" or \"Edit\" first."
 
 - Supports glob patterns like \"*.md\" or \"*test*.py\".
   The glob applies to the basename of the file (with extension).
+- Does not support double wildcard \"**/*\".
 - Returns matching file paths at all depths sorted by modification time.
   Limit the depth of the search by providing the `depth` argument.
 - When you are doing an open ended search that may require multiple rounds
