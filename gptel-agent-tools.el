@@ -221,6 +221,17 @@ ARG-VALUES is the list of arguments for the tool call."
      inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
     (gptel-agent--confirm-overlay from (point) t)))
 
+(defun gptel-agent--eval-bash (command)
+  "Execute a bash command and return its output.
+
+COMMAND is the bash command string to execute."
+  (with-temp-buffer
+    (let* ((exit-code (call-process "bash" nil (current-buffer) nil "-c" command))
+           (output (buffer-string)))
+      (if (zerop exit-code)
+          output
+        (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s" exit-code output)))))
+
 ;;; Web tools
 
 (defun gptel-agent--fetch-with-timeout (url url-cb tool-cb failed-msg &rest args)
@@ -556,6 +567,13 @@ diagnostics."
 
 ;;; Filesystem tools
 ;;;; Make directories
+(defun gptel-agent--mkdir (parent name)
+  (condition-case errdata
+      (progn
+        (make-directory (expand-file-name name parent) t)
+        (format "Directory %s created/verified in %s" name parent))
+    (error "Error creating directory %s in %s:\n%S" name parent errdata)))
+
 ;;;; Writing to files
 (defun gptel-agent--edit-files-preview-setup (arg-values _info)
   "Insert tool call preview for ARG-VALUES for \"Edit\" tool."
@@ -600,6 +618,17 @@ diagnostics."
                       files-affected " ")
        ")\n"))
     (gptel-agent--confirm-overlay from (point) t)))
+
+(defun gptel-agent--write-file (path filename content)
+             (unless (and (stringp path) (stringp filename) (stringp content))
+               (error "PATH, FILENAME or CONTENT is not a string, cancelling action"))
+             (let ((full-path (expand-file-name filename path)))
+               (condition-case errdata
+                   (with-temp-buffer
+                     (insert content)
+                     (write-file full-path)
+                     (format "Created file %s in %s" filename path))
+                 (error "Error: Could not write file %s:\n%S" path errdata))))
 
 (defun gptel-agent--fix-patch-headers ()
   "Fix line numbers in hunks in diff at point."
@@ -963,6 +992,30 @@ and optional context. Results are sorted by modification time."
           (insert (format "Error: search failed with exit-code %d.  Tool output:\n\n" exit-code)))
         (buffer-string)))))
 
+(defun gptel-agent--glob (pattern &optional path depth)
+             (when (string-empty-p pattern)
+               (error "Error: pattern must not be empty"))
+             (if path
+                 (unless (and (file-readable-p path) (file-directory-p path))
+                   (error "Error: path %s is not readable" path))
+               (setq path "."))
+             (unless (executable-find "tree")
+               (error "Error: Executable `tree` not found.  This tool cannot be used"))
+             (let ((full-path (expand-file-name path)))
+               (with-temp-buffer
+                 (let* ((args (list "-l" "-f" "-i" "-I" ".git"
+                                    "--sort=mtime" "--ignore-case"
+                                    "--prune" "-P" pattern full-path))
+                        (args (if (natnump depth)
+                                  (nconc args (list "-L" (number-to-string depth)))
+                                args))
+                        (exit-code (apply #'call-process "tree" nil t nil args)))
+                   (when (/= exit-code 0)
+                     (goto-char (point-min))
+                     (insert (format "Glob failed with exit code %d\n.STDOUT:\n\n"
+                                     exit-code))))
+                 (buffer-string))))
+
 ;;; Todo-write tool (task tracking)
 (defvar-local gptel-agent--todos nil)
 
@@ -1220,16 +1273,7 @@ Error details: %S"
 
 (gptel-make-tool
  :name "Bash"
- :function (lambda (command)
-             "Execute a bash command and return its output.
-
-COMMAND is the bash command string to execute."
-             (with-temp-buffer
-               (let* ((exit-code (call-process "bash" nil (current-buffer) nil "-c" command))
-                      (output (buffer-string)))
-                 (if (zerop exit-code)
-                     output
-                   (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s" exit-code output)))))
+ :function 'gptel-agent--eval-bash
  :description "Execute Bash commands.
 
 This tool provides access to a Bash shell with GNU coreutils (or equivalents) available.
@@ -1380,12 +1424,7 @@ too."
 (gptel-make-tool
  :name "Mkdir"
  :description "Create a new directory with the given name in the specified parent directory"
- :function (lambda (parent name)
-             (condition-case errdata
-                 (progn
-                   (make-directory (expand-file-name name parent) t)
-                   (format "Directory %s created/verified in %s" name parent))
-               (error "Error creating directory %s in %s:\n%S" name parent errdata)))
+ :function 'gptel-agent--mkdir
  :args (list '( :name "parent"
                 :type "string"
                 :description "The parent directory where the new directory should be created, e.g. /tmp")
@@ -1468,16 +1507,7 @@ specific location with no changes to the surrounding context."
  :description "Create a new file with the specified content.
 Overwrites an existing file, so use with care!
 Consider using the more granular tools \"Insert\" or \"Edit\" first."
- :function (lambda (path filename content)
-             (unless (and (stringp path) (stringp filename) (stringp content))
-               (error "PATH, FILENAME or CONTENT is not a string, cancelling action"))
-             (let ((full-path (expand-file-name filename path)))
-               (condition-case errdata
-                   (with-temp-buffer
-                     (insert content)
-                     (write-file full-path)
-                     (format "Created file %s in %s" filename path))
-                 (error "Error: Could not write file %s:\n%S" path errdata))))
+ :function 'gptel-agent--write-file
  :args (list '( :name "path"
                 :type "string"
                 :description "The directory where to create the file, \".\" is the current directory.")
@@ -1503,29 +1533,7 @@ Consider using the more granular tools \"Insert\" or \"Edit\" first."
   of globbing and grepping, use the \"task\" tool instead
 - You can call multiple tools in a single response.  It is always better to
   speculatively perform multiple searches in parallel if they are potentially useful."
- :function (lambda (pattern &optional path depth)
-             (when (string-empty-p pattern)
-               (error "Error: pattern must not be empty"))
-             (if path
-                 (unless (and (file-readable-p path) (file-directory-p path))
-                   (error "Error: path %s is not readable" path))
-               (setq path "."))
-             (unless (executable-find "tree")
-               (error "Error: Executable `tree` not found.  This tool cannot be used"))
-             (let ((full-path (expand-file-name path)))
-               (with-temp-buffer
-                 (let* ((args (list "-l" "-f" "-i" "-I" ".git"
-                                    "--sort=mtime" "--ignore-case"
-                                    "--prune" "-P" pattern full-path))
-                        (args (if (natnump depth)
-                                  (nconc args (list "-L" (number-to-string depth)))
-                                args))
-                        (exit-code (apply #'call-process "tree" nil t nil args)))
-                   (when (/= exit-code 0)
-                     (goto-char (point-min))
-                     (insert (format "Glob failed with exit code %d\n.STDOUT:\n\n"
-                                     exit-code))))
-                 (buffer-string))))
+ :function 'gptel-agent--glob
  :args '(( :name "pattern"
            :type string
            :description "Glob pattern to match, for example \"*.el\". Must not be empty.
