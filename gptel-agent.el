@@ -89,6 +89,16 @@ for gptel sub-agent definitions by `gptel-agent'."
   :type '(repeat directory)
   :group 'gptel-agent)
 
+(defcustom gptel-agent-skill-dirs nil
+  "Agent skill definition directories.
+
+Each directory location listed here is expected to have agent
+skills. An agent skill is a directory with atleast one file named
+\"SKILL.md\".
+See https://agentskills.io for more details on agentskills."
+  :type '(repeat directory)
+  :group 'gptel-agent)
+
 ;;; State update
 (defvar gptel-agent--agents nil)
 
@@ -370,6 +380,49 @@ Signals an error if:
             (let ((expanded-body (buffer-substring-no-properties
                                   body-start (point-max))))
               (plist-put props-plist :system expanded-body))))))))
+
+;;; Agentskill loading and processing
+
+(defvar gptel-agent--skills nil
+  "Known skills alist.
+
+The key is the name. The value is a cons (LOCATION . SKILL-PLIST).
+LOCATION is path to the skill's directory. SKILL-PLIST is the header
+of the corresponding SKILL.md as a plist.")
+
+(defun gptel-agent--skills-update ()
+  "Update the known skills list from `gptel-agent-skill-dirs'."
+  (setq gptel-agent--skills nil)
+  (mapcar (lambda (dir)
+            (dolist (skill-file (directory-files-recursively dir "SKILL\\.md"))
+              (pcase-let ((`(,name . ,skill-plist)
+                           (gptel-agent-read-file skill-file)))
+                ;; validating skill definition
+                (if (plist-get skill-plist :description)
+                    (setf (alist-get name gptel-agent--skills nil nil #'string-equal)
+                          (cons (file-name-directory skill-file) skill-plist))
+                  (warn "Skill %s (at %s) does not have a description. Ignoring %s skill."
+                        name skill-file name)))))
+          gptel-agent-skill-dirs)
+  gptel-agent--skills)
+
+(defun gptel-agent--skills-system-message ()
+  "Returns the message describing the list of known skills."
+  ;; Copied from opencode
+  ;; (https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/skill.ts)
+  (concat "Load a skill to get detailed instructions for a specific task."
+          "Skills provide specialized knowledge and step-by-step guidance."
+          "Use this when a task matches an available skill's description."
+          "\n<available_skills>\n"
+          (mapconcat (lambda (skill-def)
+                       (format "  <skill>
+    <name>%s</name>
+    <description>%s</description>
+  </skill>"
+                               (car skill-def)
+                               (plist-get (cddr skill-def) :description)))
+                     gptel-agent--skills "\n")
+          "\n</available_skills>"))
 
 ;;; Commands
 
