@@ -1752,7 +1752,7 @@ Only one todo can be `in_progress` at a time."
  :description "Load a skill into the current conversation.
 
 Each skill provides guidance on how to execute a specific task.
-You can invoke a skill with optional args, the args are for your future reference only. 
+You can invoke a skill with optional args, the args are for your future reference only.
 
 When to use:
 - When a skill is relevant, you must invoke this tool IMMEDIATELY
@@ -1764,7 +1764,7 @@ How to use:
 - Invoke with the skill name and optional args.  The args are for your reference only
 - Examples:
     - `skill: \"pdf\"` - invoke the pdf skill
-    - `skill: \"commit\", args: \"-m 'Fix bug'\"` - invoke with arguments  
+    - `skill: \"commit\", args: \"-m 'Fix bug'\"` - invoke with arguments
     - `skill: \"review-pr\", args: \"123\"` - invoke with arguments"
  :function #'gptel-agent--get-skill
  :args '(( :name "skill"
