@@ -226,25 +226,34 @@ ARG-VALUES is the list of arguments for the tool call."
 
 CALLBACK is called with the command output string when the process finishes.
 COMMAND is the bash command string to execute."
-  (let* ((output-buffer (generate-new-buffer " *gptel-agent-bash*"))
-         (proc (make-process
-                :name "gptel-agent-bash"
-                :buffer output-buffer
-                :command (list "bash" "-c" command)
-                :connection-type 'pipe
-                :sentinel
-                (lambda (process _event)
-                  (when (memq (process-status process) '(exit signal))
-                    (let* ((exit-code (process-exit-status process))
-                           (output (with-current-buffer (process-buffer process)
-                                     (buffer-string))))
-                      (kill-buffer (process-buffer process))
-                      (funcall callback
-                               (if (zerop exit-code)
-                                   output
-                                 (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s"
-                                         exit-code output)))))))))
-    proc))
+  (condition-case err
+      (let* ((output-buffer (generate-new-buffer " *gptel-agent-bash*"))
+             (proc (make-process
+                    :name "gptel-agent-bash"
+                    :buffer output-buffer
+                    :command (list "bash" "-c" command)
+                    :connection-type 'pipe
+                    :sentinel
+                    (lambda (process _event)
+                      (condition-case sentinel-err
+                          (when (memq (process-status process) '(exit signal))
+                            (let* ((exit-code (process-exit-status process))
+                                   (output (with-current-buffer (process-buffer process)
+                                             (buffer-string))))
+                              (kill-buffer (process-buffer process))
+                              (funcall callback
+                                       (if (zerop exit-code)
+                                           output
+                                         (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s"
+                                                 exit-code output)))))
+                        (error
+                         (kill-buffer (process-buffer process))
+                         (funcall callback
+                                  (format "Error in sentinel: %s" sentinel-err))))))))
+        proc)
+    (error
+     (funcall callback (format "Failed to start process: %s" err))
+     nil)))
 
 ;;; Web tools
 
