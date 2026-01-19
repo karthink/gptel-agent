@@ -123,16 +123,11 @@ any templates to the system prompt."
       (cl-remf agent-plist :name)
       (cons name agent-plist))))
 
-;;;###autoload
-(defun gptel-agent-update ()
-  "Update agent definitions from `gptel-agent-dirs'."
-  ;; Load skills to be included in the system message
-  (gptel-agent--skills-update)
-
-  ;; First pass: discover all agents and collect their file paths
+(defun gptel-agent--update-agents ()
+  "Update agent definitions from `gptel-agent-dirs'.
+Returns an alist of (agent-name . file-path)."
   (setq gptel-agent--agents nil)
-  (let ((agent-files nil)               ; Alist of (agent-name . file-path)
-        (skills-str (gptel-agent--skills-system-message)))
+  (let ((agent-files nil))               ; Alist of (agent-name . file-path)
     (mapc (lambda (dir)
             (dolist (agent-file (cl-delete-if-not #'file-regular-p
                                                   (directory-files dir 'full)))
@@ -142,8 +137,17 @@ any templates to the system prompt."
                       agent-plist)
                 (push (cons name agent-file) agent-files))))
           gptel-agent-dirs)
+    agent-files))
 
-    ;; Second pass: reload agents with template expansion
+;;;###autoload
+(defun gptel-agent-update ()
+  "Update agents."
+  ;; Load skills to be included in the system message
+  (gptel-agent--update-skills)
+
+  (let ((agent-files (gptel-agent--update-agents))
+        (skills-str (gptel-agent--skills-system-message)))
+    ;; reload agents with template expansion
     (dolist (agent-entry gptel-agent--agents)
       (let* ((name (car agent-entry))
              (agent-file (cdr (assoc name agent-files)))
@@ -390,7 +394,7 @@ The key is the name. The value is a cons (LOCATION . SKILL-PLIST).
 LOCATION is path to the skill's directory. SKILL-PLIST is the header
 of the corresponding SKILL.md as a plist.")
 
-(defun gptel-agent--skills-update ()
+(defun gptel-agent--update-skills ()
   "Update the known skills list from `gptel-agent-skill-dirs'."
   (setq gptel-agent--skills nil)
   (mapcar (lambda (dir)
