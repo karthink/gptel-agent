@@ -928,8 +928,12 @@ PATH is the optional directory to search (defaults to current directory).
 DEPTH limits recursion depth when provided (non-negative integer).
 
 Returns a string listing matching files with full paths, sorted by
-modification time.  Raises an error if PATTERN is empty, PATH is not
-readable, or the `tree' executable is not found."
+modification time.  If the output is too large (>20000 chars), it writes
+the full results to a temporary file and returns a truncated version with
+instructions to use `Read' for the full contents.
+
+Raises an error if PATTERN is empty, PATH is not readable, or the
+`tree' executable is not found."
   (when (string-empty-p pattern)
     (error "Error: pattern must not be empty"))
   (if path
@@ -951,6 +955,32 @@ readable, or the `tree' executable is not found."
           (goto-char (point-min))
           (insert (format "Glob failed with exit code %d\n.STDOUT:\n\n"
                           exit-code))))
+      (when (> (buffer-size) 20000)
+        ;; Too large - save to temp file and return truncated info
+        (let* ((temp-dir (expand-file-name "gptel-agent-temp"
+                                           (temporary-file-directory)))
+               (temp-file (expand-file-name
+                           (format "glob-%s-%s.txt"
+                                   (format-time-string "%Y%m%d-%H%M%S")
+                                   (random 10000))
+                           temp-dir)))
+          (unless (file-directory-p temp-dir) (make-directory temp-dir t))
+          (write-region nil nil temp-file)
+          (let ((max-lines 50)
+                (orig-size (buffer-size))
+                (orig-lines (line-number-at-pos (point-max))))
+            ;; Insert header
+            (goto-char (point-min))
+            (insert (format "Glob results too large (%d chars, %d lines)\
+ for context window.\nStored in: %s\n\nFirst %d lines:\n\n"
+                            orig-size orig-lines temp-file max-lines))
+            ;; Truncate to first max-lines lines
+            (forward-line max-lines)
+            (delete-region (point) (point-max))
+            ;; Insert footer
+            (goto-char (point-max))
+            (insert (format "\n\n[Use Read tool with file_path=\"%s\" to view full results]"
+                            temp-file)))))
       (buffer-string))))
 
 ;;;; Read files or directories
