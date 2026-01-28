@@ -1086,7 +1086,7 @@ file.  Results are sorted by modification time."
                         (list (file-relative-name path git-root))
                         ;; glob restriction
                         (when glob
-                          (list (format ":(glob)%s" glob))))))
+                          (list (format "%s" glob))))))
                 ;; ---------------- ripgrep ----------------
                 ("rg"
                  (delq nil
