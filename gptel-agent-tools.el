@@ -1058,36 +1058,65 @@ and optional context.  Results are limited to 1000 or fewer matches per
 file.  Results are sorted by modification time."
   (unless (file-readable-p path)
     (error "Error: File or directory %s is not readable" path))
-  (let ((grepper (or (executable-find "rg") (executable-find "grep"))))
-    (unless grepper
-      (error "Error: ripgrep/grep not available, this tool cannot be used"))
+  (let* ((path (expand-file-name (substitute-in-file-name path)))
+         (git-root (vc-git-root path))
+         (grepper
+          (cond
+           (git-root "git")
+           ((executable-find "rg") "rg")
+           ((executable-find "grep") "grep")
+           (t (error "Error: no grep tool available")))))
     (with-temp-buffer
-      (let* ((cmd (file-name-sans-extension (file-name-nondirectory grepper)))
+      (let* ((default-directory (or git-root default-directory))
              (args
-              (cond
-               ((string= "rg" cmd)
-                (delq nil (list "--sort=modified"
-                                (and (natnump context-lines)
-                                     (format "--context=%d" context-lines))
-                                (and glob (format "--glob=%s" glob))
-                                ;; "--files-with-matches"
-                                "--max-count=1000"
-                                "--heading" "--line-number" "-e" regex
-                                (expand-file-name (substitute-in-file-name path)))))
-               ((string= "grep" cmd)
-                (delq nil (list "--recursive"
-                                (and (natnump context-lines)
-                                     (format "--context=%d" context-lines))
-                                (and glob (format "--include=%s" glob))
-                                "--max-count=1000"
-                                "--line-number" "--regexp" regex
-                                (expand-file-name (substitute-in-file-name path)))))
-               (t (error "Error: failed to identify grepper"))))
-             (exit-code (apply #'call-process grepper nil '(t t) nil args)))
-        (when (/= exit-code 0)
-          (goto-char (point-min))
-          (insert (format "Error: search failed with exit-code %d.  Tool output:\n\n" exit-code)))
-        (buffer-string)))))
+              (pcase grepper
+                ;; ---------------- git grep ----------------
+                ("git"
+                 (delq nil
+                       (append
+                        (list "grep"
+                              "--line-number"
+                              "--no-color"
+                              (and (natnump context-lines)
+                                   (format "-C%d" context-lines))
+                              "--max-count=1000"
+                              "-e" regex
+                              "--")
+                        ;; restrict path
+                        (list (file-relative-name path git-root))
+                        ;; glob restriction
+                        (when glob
+                          (list (format ":(glob)%s" glob))))))
+                ;; ---------------- ripgrep ----------------
+                ("rg"
+                 (delq nil
+                       (list "--sort=modified"
+                             (and (natnump context-lines)
+                                  (format "--context=%d" context-lines))
+                             (and glob (format "--glob=%s" glob))
+                             "--max-count=1000"
+                             "--heading"
+                             "--line-number"
+                             "-e" regex
+                             path)))
+                ;; ---------------- grep ----------------
+                ("grep"
+                 (delq nil
+                       (list "--recursive"
+                             (and (natnump context-lines)
+                                  (format "--context=%d" context-lines))
+                             (and glob (format "--include=%s" glob))
+                             "--max-count=1000"
+                             "--line-number"
+                             "--regexp" regex
+                             path))))))
+        (let ((exit-code (apply #'call-process grepper nil '(t t) nil args)))
+          (when (and (/= exit-code 0)
+                     ;; git grep returns 1 if no matches
+                     (not (and (string= grepper "git") (= exit-code 1))))
+            (goto-char (point-min))
+            (insert (format "Error: search failed with exit-code %d\n\n" exit-code)))
+          (buffer-string))))))
 
 ;;; Todo-write tool (task tracking)
 (defvar-local gptel-agent--todos nil)
