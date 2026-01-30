@@ -1082,8 +1082,6 @@ file.  Results are sorted by modification time."
                               "--max-count=1000"
                               "-e" regex
                               "--")
-                        ;; restrict path
-                        (list (file-relative-name path git-root))
                         ;; glob restriction
                         (when glob
                           (list (format "%s" glob))))))
