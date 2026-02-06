@@ -1674,8 +1674,7 @@ Examples: *.md, *.rs"
            :description "Number of lines of context to retrieve around each match (0-15 inclusive).
 Optional, defaults to 0."
            :optional t
-           :type integer
-           :maximum 15))
+           :type integer))
  :category "gptel-agent"
  :include t)
 
@@ -1693,14 +1692,14 @@ Only one todo can be `in_progress` at a time."
      ( :type object
        :properties
        (:content
-        ( :type string :minLength 1
+        ( :type string
           :description "Imperative form describing what needs to be done (e.g., 'Run tests')")
         :status
         ( :type string
           :enum ["pending" "in_progress" "completed"]
           :description "Task status: pending, in_progress (exactly one), or completed")
         :activeForm
-        ( :type string :minLength 1
+        ( :type string
           :description "Present continuous form shown during execution (e.g., 'Running tests')")))))
  :category "gptel-agent")
 
