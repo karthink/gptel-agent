@@ -102,11 +102,17 @@ See https://agentskills.io for more details on agentskills."
 ;;; State update
 (defvar gptel-agent--agents nil)
 
-(defun gptel-agent-read-file (agent-file &optional templates)
+(defun gptel-agent-read-file (agent-file &optional templates metadata-only)
   "Read a preset/agent from AGENT-FILE.
 
-If TEMPLATES is-nil, read only the front-matter and do not apply
-any templates to the system prompt."
+If TEMPLATES is non-nil, read the system-prompt with templates applied
+to them.  TEMPLATES should be an alist of (VAR-NAME . VAR-VALUE) for
+template expansion. Template variables in the format {{VAR-NAME}} in
+the markdown body will be replaced with VAR-VALUE.
+
+If METADATA-ONLY is non-nil, only the header/metadata of the
+preset/agent will be returned.  If TEMPLATES and METADATA-ONLY are
+both non-nil, TEMPLATES will be ignored."
   (if (not (and (file-readable-p agent-file)
                 (file-regular-p agent-file)))
       (prog1 nil
@@ -114,9 +120,9 @@ any templates to the system prompt."
     (let* ((agent-plist
             (pcase (file-name-extension agent-file)
               ("org" (gptel-agent-parse-org-properties
-                      agent-file nil templates))
+                      agent-file nil templates metadata-only))
               ("md" (gptel-agent-parse-markdown-frontmatter
-                     agent-file nil templates))))
+                     agent-file nil templates metadata-only))))
            (name (or (plist-get agent-plist :name)
                      (let ((filename (file-name-base agent-file)))
                        (replace-regexp-in-string " " "-" filename)))))
@@ -203,7 +209,7 @@ Substitution happens in-place in the buffer."
 ;; - Markdown files with YAML frontmatter
 ;; - Org files with PROPERTIES blocks
 
-(defun gptel-agent-parse-markdown-frontmatter (file-path &optional validator templates)
+(defun gptel-agent-parse-markdown-frontmatter (file-path &optional validator templates metadata-only)
   "Parse a markdown file with optional YAML frontmatter.
 
 FILE-PATH is the path to a markdown file.
@@ -216,13 +222,15 @@ TEMPLATES is an optional alist of (VAR-NAME . VAR-VALUE) for template
 expansion.  Template variables in the format {{VAR-NAME}} in the markdown
 body will be replaced with VAR-VALUE.
 
+If METADATA-ONLY is non-nil, only the header/metadata of the
+preset/agent will be returned.  If TEMPLATES and METADATA-ONLY are
+both non-nil, TEMPLATES will be ignored.
+
+
 Returns a plist with:
 - All YAML frontmatter keys as keywords
-- :system containing the markdown body text after frontmatter (with
-  templates expanded)
-
-If no frontmatter block exists, returns a plist with just the :system
-key containing the entire file content.
+- When metadata-only is nil, :system containing the markdown body text
+  after frontmatter (with templates expanded)
 
 Signals an error if:
 - The frontmatter block is malformed (opening without closing delimiter)
@@ -236,15 +244,19 @@ Signals an error if:
 
     ;; Check if file starts with frontmatter delimiter
     (if (not (looking-at-p "^---[ \t]*$"))
-        ;; No frontmatter - return plist with :system key containing entire file content
-        (let ((file-content (buffer-string)))
-          (if templates
-              (progn                    ;Apply template substitutions
-                (gptel-agent--expand-templates (point-min) templates)
-                ;; Extract the expanded body text
-                (list :system (buffer-substring-no-properties (point-min) (point-max))))
-            ;; Return plist with system content as-is
-            (list :system file-content)))
+        ;; No frontmatter
+        (if metadata-only
+            ;; Requested only metadata but none exists -> return empty plist (nil)
+            nil
+          ;; Return plist with :system key containing entire file content
+          (let ((file-content (buffer-string)))
+            (if templates
+                (progn                    ;Apply template substitutions
+                  (gptel-agent--expand-templates (point-min) templates)
+                  ;; Extract the expanded body text
+                  (list :system (buffer-substring-no-properties (point-min) (point-max))))
+              ;; Return plist with system content as-is
+              (list :system file-content))))
 
       ;; Move past opening delimiter
       (forward-line 1)
@@ -282,15 +294,16 @@ Signals an error if:
                     (error "Invalid frontmatter key: %s" key)))
                 (setq current-plist (cddr current-plist))))
 
-            (if (not templates)
+            (if metadata-only
                 parsed-yaml
-              ;; Apply template substitutions in place, then extract body text
-              (gptel-agent--expand-templates body-start templates)
+              (when templates
+                ;; Apply template substitutions in place, then extract body text
+                (gptel-agent--expand-templates body-start templates))
               ;; Extract the expanded body text
               (let ((expanded-body (buffer-substring-no-properties body-start (point-max))))
                 (plist-put parsed-yaml :system expanded-body)))))))))
 
-(defun gptel-agent-parse-org-properties (file-path &optional validator templates)
+(defun gptel-agent-parse-org-properties (file-path &optional validator templates metadata-only)
   "Parse an Org file with properties in a :PROPERTIES: drawer.
 
 FILE-PATH is the path to an Org file.
@@ -303,6 +316,10 @@ TEMPLATES is an optional alist of (VAR-NAME . VAR-VALUE) for template
 expansion.  Template variables in the format {{VAR-NAME}} in the Org body
 will be replaced with VAR-VALUE.
 
+If METADATA-ONLY is non-nil, only the header/metadata of the
+preset/agent will be returned.  If TEMPLATES and METADATA-ONLY are
+both non-nil, TEMPLATES will be ignored.
+
 The function expects a :PROPERTIES: block at the top of the file
  (before any headlines), with keys like name, description, tools,
 backend, model, etc. Property names are case-insensitive and will
@@ -310,11 +327,8 @@ be converted to lowercase keyword symbols.
 
 Returns a plist with:
 - All properties from the :PROPERTIES: drawer as keywords
-- :system containing the Org file body text after the property
-  block (with templates expanded)
-
-If no property block exists, returns a plist with just the :system
-key containing the entire file content.
+- When metadata-only is nil, :system containing the Org file body text
+  after the property block (with templates expanded)
 
 Signals an error if:
 - A key in the property block is not allowed by the validator"
@@ -329,15 +343,19 @@ Signals an error if:
     ;; Try to get the property block at this position
     (let ((prop-range (org-get-property-block)))
       (if (not prop-range)
-          ;; No property block - return plist with :system key containing entire file content
-          (let ((file-content (buffer-string)))
-            (if templates
-                (progn                  ;Apply template substitutions
-                  (gptel-agent--expand-templates (point-min) templates)
-                  ;; Extract the expanded body text
-                  (list :system (buffer-substring-no-properties (point-min) (point-max))))
-              ;; Return plist with system content as-is
-              (list :system file-content)))
+          ;; No property block
+          (if metadata-only
+              ;; Requested only metadata but none exists -> return empty plist (nil)
+              nil
+            ;; Return body as :system, applying templates only when metadata-only is nil
+            (let ((file-content (buffer-string)))
+              (if templates
+                  (progn                  ;Apply template substitutions
+                    (gptel-agent--expand-templates (point-min) templates)
+                    ;; Extract the expanded body text
+                    (list :system (buffer-substring-no-properties (point-min) (point-max))))
+                ;; Return plist with system content as-is
+                (list :system file-content))))
 
         ;; Extract properties as an alist
         (let* ((props-alist (org-entry-properties (point-min) 'standard))
@@ -376,14 +394,16 @@ Signals an error if:
                   (:parents (plist-put props-plist key
                                        (mapcar #'intern (ensure-list (read val)))))))))
 
-          (if (not templates)
+          ;; If only metadata requested, return the props plist (ignore templates)
+          (if metadata-only
               props-plist
-            ;; Apply template substitutions in place, then extract body text
-            (gptel-agent--expand-templates body-start templates)
+            (when templates
+              ;; Apply template substitutions in place, then extract body text
+              (gptel-agent--expand-templates body-start templates))
             ;; Extract the expanded body text
-            (let ((expanded-body (buffer-substring-no-properties
+            (let ((body-text (buffer-substring-no-properties
                                   body-start (point-max))))
-              (plist-put props-plist :system expanded-body))))))))
+              (plist-put props-plist :system body-text))))))))
 
 ;;; Agentskill loading and processing
 
