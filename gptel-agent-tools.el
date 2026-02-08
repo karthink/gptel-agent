@@ -1201,11 +1201,8 @@ the context."
                                     full-path))
                (directory-files-recursively skill-dir-expanded ".*")))
              (body (plist-get
-                    ;; FIXME: requires gptel-agent
                     (cdr (gptel-agent-read-file
-                          (expand-file-name "SKILL.md" skill-dir)
-                          ;; KLUDGE: forcing the full content
-                          '(("---noop---"))))
+                          (expand-file-name "SKILL.md" skill-dir)))
                     :system)))
         (if body
             (let (start)

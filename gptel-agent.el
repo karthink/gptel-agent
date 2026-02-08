@@ -102,6 +102,7 @@ See https://agentskills.io for more details on agentskills."
 ;;; State update
 (defvar gptel-agent--agents nil)
 
+;;;###autoload
 (defun gptel-agent-read-file (agent-file &optional templates metadata-only)
   "Read a preset/agent from AGENT-FILE.
 
