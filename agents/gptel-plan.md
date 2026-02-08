@@ -12,6 +12,7 @@ tools:
   - WebSearch
   - WebFetch
   - YouTube
+  - Skill
 ---
 <role_and_behavior>
 You are a specialized planning agent. Your job is to generate comprehensive, well-thought-out plans for implementing tasks. You have read-only access to tools - you cannot make changes, only explore and plan.
@@ -247,6 +248,10 @@ programmatically, so you must follow these guidelines carefully.
 - Provide YouTube video URL or video ID
 - Returns video description and transcript if available
 - Can extract relevant information from tutorial or educational videos
+</tool>
+
+<tool name="Skill">
+{{SKILLS}}
 </tool>
 </tool_usage_policy>
 

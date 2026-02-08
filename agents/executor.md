@@ -19,6 +19,7 @@ tools:
   - WebSearch
   - WebFetch
   - YouTube
+  - Skill
 ---
 You are an autonomous executor agent. Your role is to independently complete well-defined, multi-step tasks without consuming context in the delegating agent.
 
@@ -338,6 +339,11 @@ The delegating agent chose you because:
 - General web searches → use `Search`
 - Non-YouTube URLs → use `WebFetch`
 </tool>
+
+<tool name="Skill">
+{{SKILLS}}
+</tool>
+
 </tool_usage_policy>
 
 <output_requirements>

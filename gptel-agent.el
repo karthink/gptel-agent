@@ -89,14 +89,45 @@ for gptel sub-agent definitions by `gptel-agent'."
   :type '(repeat directory)
   :group 'gptel-agent)
 
+(defcustom gptel-agent-skill-dirs '("~/.claude/skills/"
+                                    ".claude/skills/"
+                                    "~/.agents/skills" ;; codex
+                                    ".agents/skills"   ;; codex
+                                    "~/.opencode/skill/"
+                                    ".opencode/skill/"
+                                    "~/.gemini/skills/"
+                                    ".gemini/skills/")
+  "Agent skill definition directories.
+
+Each directory listed here should contain agent skills. An agent
+skill is a directory with at least one file named \"SKILL.md\".
+
+Relative paths are resolved against the current directory and
+also against the project root when searching for skills.
+
+Relative directory locations will be take precedence over absolute
+locations. If multiple skills share the same name, the one in the
+directory listed earlier takes precedence.
+
+See https://agentskills.io for more details on agentskills."
+  :type '(repeat directory)
+  :group 'gptel-agent)
+
 ;;; State update
 (defvar gptel-agent--agents nil)
 
-(defun gptel-agent-read-file (agent-file &optional templates)
+;;;###autoload
+(defun gptel-agent-read-file (agent-file &optional templates metadata-only)
   "Read a preset/agent from AGENT-FILE.
 
-If TEMPLATES is-nil, read only the front-matter and do not apply
-any templates to the system prompt."
+If TEMPLATES is non-nil, read the system-prompt with templates applied
+to them.  TEMPLATES should be an alist of (VAR-NAME . VAR-VALUE) for
+template expansion. Template variables in the format {{VAR-NAME}} in
+the markdown body will be replaced with VAR-VALUE.
+
+If METADATA-ONLY is non-nil, only the header/metadata of the
+preset/agent will be returned.  If TEMPLATES and METADATA-ONLY are
+both non-nil, TEMPLATES will be ignored."
   (if (not (and (file-readable-p agent-file)
                 (file-regular-p agent-file)))
       (prog1 nil
@@ -104,21 +135,20 @@ any templates to the system prompt."
     (let* ((agent-plist
             (pcase (file-name-extension agent-file)
               ("org" (gptel-agent-parse-org-properties
-                      agent-file nil templates))
+                      agent-file nil templates metadata-only))
               ("md" (gptel-agent-parse-markdown-frontmatter
-                     agent-file nil templates))))
+                     agent-file nil templates metadata-only))))
            (name (or (plist-get agent-plist :name)
                      (let ((filename (file-name-base agent-file)))
                        (replace-regexp-in-string " " "-" filename)))))
       (cl-remf agent-plist :name)
       (cons name agent-plist))))
 
-;;;###autoload
-(defun gptel-agent-update ()
-  "Update agent definitions from `gptel-agent-dirs'."
-  ;; First pass: discover all agents and collect their file paths
+(defun gptel-agent--update-agents ()
+  "Update agent definitions from `gptel-agent-dirs'.
+Returns an alist of (agent-name . file-path)."
   (setq gptel-agent--agents nil)
-  (let ((agent-files nil))              ; Alist of (agent-name . file-path)
+  (let ((agent-files nil))               ; Alist of (agent-name . file-path)
     (mapc (lambda (dir)
             (dolist (agent-file (cl-delete-if-not #'file-regular-p
                                                   (directory-files dir 'full)))
@@ -128,8 +158,17 @@ any templates to the system prompt."
                       agent-plist)
                 (push (cons name agent-file) agent-files))))
           gptel-agent-dirs)
+    agent-files))
 
-    ;; Second pass: reload agents with template expansion
+;;;###autoload
+(defun gptel-agent-update ()
+  "Update agents."
+  ;; Load skills to be included in the system message
+  (gptel-agent--update-skills)
+
+  (let ((agent-files (gptel-agent--update-agents))
+        (skills-str (gptel-agent--skills-system-message)))
+    ;; reload agents with template expansion
     (dolist (agent-entry gptel-agent--agents)
       (let* ((name (car agent-entry))
              (agent-file (cdr (assoc name agent-files)))
@@ -144,7 +183,9 @@ any templates to the system prompt."
                        into agent-list
                        finally return (apply #'concat agent-list)))
              ;; Create templates alist
-             (templates (list (cons "AGENTS" agents-list-str))))
+             (templates (list
+                         (cons "AGENTS" agents-list-str)
+                         (cons "SKILLS" skills-str))))
         (when agent-file                ; Parse the agent file with templates
           (setf (alist-get name gptel-agent--agents nil t #'equal)
                 (cdr (gptel-agent-read-file agent-file templates)))))))
@@ -183,7 +224,7 @@ Substitution happens in-place in the buffer."
 ;; - Markdown files with YAML frontmatter
 ;; - Org files with PROPERTIES blocks
 
-(defun gptel-agent-parse-markdown-frontmatter (file-path &optional validator templates)
+(defun gptel-agent-parse-markdown-frontmatter (file-path &optional validator templates metadata-only)
   "Parse a markdown file with optional YAML frontmatter.
 
 FILE-PATH is the path to a markdown file.
@@ -196,13 +237,15 @@ TEMPLATES is an optional alist of (VAR-NAME . VAR-VALUE) for template
 expansion.  Template variables in the format {{VAR-NAME}} in the markdown
 body will be replaced with VAR-VALUE.
 
+If METADATA-ONLY is non-nil, only the header/metadata of the
+preset/agent will be returned.  If TEMPLATES and METADATA-ONLY are
+both non-nil, TEMPLATES will be ignored.
+
+
 Returns a plist with:
 - All YAML frontmatter keys as keywords
-- :system containing the markdown body text after frontmatter (with
-  templates expanded)
-
-If no frontmatter block exists, returns a plist with just the :system
-key containing the entire file content.
+- When metadata-only is nil, :system containing the markdown body text
+  after frontmatter (with templates expanded)
 
 Signals an error if:
 - The frontmatter block is malformed (opening without closing delimiter)
@@ -216,15 +259,19 @@ Signals an error if:
 
     ;; Check if file starts with frontmatter delimiter
     (if (not (looking-at-p "^---[ \t]*$"))
-        ;; No frontmatter - return plist with :system key containing entire file content
-        (let ((file-content (buffer-string)))
-          (if templates
-              (progn                    ;Apply template substitutions
-                (gptel-agent--expand-templates (point-min) templates)
-                ;; Extract the expanded body text
-                (list :system (buffer-substring-no-properties (point-min) (point-max))))
-            ;; Return plist with system content as-is
-            (list :system file-content)))
+        ;; No frontmatter
+        (if metadata-only
+            ;; Requested only metadata but none exists -> return empty plist (nil)
+            nil
+          ;; Return plist with :system key containing entire file content
+          (let ((file-content (buffer-string)))
+            (if templates
+                (progn                    ;Apply template substitutions
+                  (gptel-agent--expand-templates (point-min) templates)
+                  ;; Extract the expanded body text
+                  (list :system (buffer-substring-no-properties (point-min) (point-max))))
+              ;; Return plist with system content as-is
+              (list :system file-content))))
 
       ;; Move past opening delimiter
       (forward-line 1)
@@ -262,15 +309,16 @@ Signals an error if:
                     (error "Invalid frontmatter key: %s" key)))
                 (setq current-plist (cddr current-plist))))
 
-            (if (not templates)
+            (if metadata-only
                 parsed-yaml
-              ;; Apply template substitutions in place, then extract body text
-              (gptel-agent--expand-templates body-start templates)
+              (when templates
+                ;; Apply template substitutions in place, then extract body text
+                (gptel-agent--expand-templates body-start templates))
               ;; Extract the expanded body text
               (let ((expanded-body (buffer-substring-no-properties body-start (point-max))))
                 (plist-put parsed-yaml :system expanded-body)))))))))
 
-(defun gptel-agent-parse-org-properties (file-path &optional validator templates)
+(defun gptel-agent-parse-org-properties (file-path &optional validator templates metadata-only)
   "Parse an Org file with properties in a :PROPERTIES: drawer.
 
 FILE-PATH is the path to an Org file.
@@ -283,6 +331,10 @@ TEMPLATES is an optional alist of (VAR-NAME . VAR-VALUE) for template
 expansion.  Template variables in the format {{VAR-NAME}} in the Org body
 will be replaced with VAR-VALUE.
 
+If METADATA-ONLY is non-nil, only the header/metadata of the
+preset/agent will be returned.  If TEMPLATES and METADATA-ONLY are
+both non-nil, TEMPLATES will be ignored.
+
 The function expects a :PROPERTIES: block at the top of the file
  (before any headlines), with keys like name, description, tools,
 backend, model, etc. Property names are case-insensitive and will
@@ -290,11 +342,8 @@ be converted to lowercase keyword symbols.
 
 Returns a plist with:
 - All properties from the :PROPERTIES: drawer as keywords
-- :system containing the Org file body text after the property
-  block (with templates expanded)
-
-If no property block exists, returns a plist with just the :system
-key containing the entire file content.
+- When metadata-only is nil, :system containing the Org file body text
+  after the property block (with templates expanded)
 
 Signals an error if:
 - A key in the property block is not allowed by the validator"
@@ -309,15 +358,19 @@ Signals an error if:
     ;; Try to get the property block at this position
     (let ((prop-range (org-get-property-block)))
       (if (not prop-range)
-          ;; No property block - return plist with :system key containing entire file content
-          (let ((file-content (buffer-string)))
-            (if templates
-                (progn                  ;Apply template substitutions
-                  (gptel-agent--expand-templates (point-min) templates)
-                  ;; Extract the expanded body text
-                  (list :system (buffer-substring-no-properties (point-min) (point-max))))
-              ;; Return plist with system content as-is
-              (list :system file-content)))
+          ;; No property block
+          (if metadata-only
+              ;; Requested only metadata but none exists -> return empty plist (nil)
+              nil
+            ;; Return body as :system, applying templates only when metadata-only is nil
+            (let ((file-content (buffer-string)))
+              (if templates
+                  (progn                  ;Apply template substitutions
+                    (gptel-agent--expand-templates (point-min) templates)
+                    ;; Extract the expanded body text
+                    (list :system (buffer-substring-no-properties (point-min) (point-max))))
+                ;; Return plist with system content as-is
+                (list :system file-content))))
 
         ;; Extract properties as an alist
         (let* ((props-alist (org-entry-properties (point-min) 'standard))
@@ -356,14 +409,74 @@ Signals an error if:
                   (:parents (plist-put props-plist key
                                        (mapcar #'intern (ensure-list (read val)))))))))
 
-          (if (not templates)
+          ;; If only metadata requested, return the props plist (ignore templates)
+          (if metadata-only
               props-plist
-            ;; Apply template substitutions in place, then extract body text
-            (gptel-agent--expand-templates body-start templates)
+            (when templates
+              ;; Apply template substitutions in place, then extract body text
+              (gptel-agent--expand-templates body-start templates))
             ;; Extract the expanded body text
-            (let ((expanded-body (buffer-substring-no-properties
+            (let ((body-text (buffer-substring-no-properties
                                   body-start (point-max))))
-              (plist-put props-plist :system expanded-body))))))))
+              (plist-put props-plist :system body-text))))))))
+
+;;; Agentskill loading and processing
+
+(defvar gptel-agent--skills nil
+  "Known skills alist.
+
+The key is the name. The value is a cons (LOCATION . SKILL-PLIST).
+LOCATION is path to the skill's directory. SKILL-PLIST is the header
+of the corresponding SKILL.md as a plist.")
+
+(defun gptel-agent--update-skills ()
+  "Update the known skills list from `gptel-agent-skill-dirs'."
+  (setq gptel-agent--skills nil)
+  (mapcar (lambda (dir)
+            (when (file-exists-p dir)
+             (dolist (skill-file (directory-files-recursively dir "SKILL\\.md"))
+              (pcase-let ((`(,name . ,skill-plist)
+                           (gptel-agent-read-file skill-file)))
+                ;; validating skill definition
+                (if (plist-get skill-plist :description)
+                    (setf (alist-get name gptel-agent--skills nil nil #'string-equal)
+                          (cons (file-name-directory skill-file) skill-plist))
+                  (warn "Skill %s (at %s) does not have a description. Ignoring %s skill."
+                        name skill-file name))))))
+          ;; To preserve precedence, the list should be reversed and resolved
+          ;; relative names should be at the end.
+          (cl-loop for dir in gptel-agent-skill-dirs
+                with project-root = (when-let* ((proj (project-current))
+                                                (root (project-root proj))
+                                                (_ (not (equal root default-directory))))
+                                      root)
+                if (file-name-absolute-p dir)
+                  collect dir into absolute-dirs
+                else
+                  collect (expand-file-name dir) into relative-dirs
+                  and
+                  when project-root
+                    collect (expand-file-name dir project-root) into relative-dirs
+                finally return (append (reverse absolute-dirs) (reverse relative-dirs))))
+  gptel-agent--skills)
+
+(defun gptel-agent--skills-system-message ()
+  "Returns the message describing the list of known skills."
+  ;; Copied from opencode
+  ;; (https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/skill.ts)
+  (concat "Load a skill to get detailed instructions for a specific task."
+          "Skills provide specialized knowledge and step-by-step guidance."
+          "Use this when a task matches an available skill's description."
+          "\n<available_skills>\n"
+          (mapconcat (lambda (skill-def)
+                       (format "  <skill>
+    <name>%s</name>
+    <description>%s</description>
+  </skill>"
+                               (car skill-def)
+                               (plist-get (cddr skill-def) :description)))
+                     gptel-agent--skills "\n")
+          "\n</available_skills>"))
 
 ;;; Commands
 

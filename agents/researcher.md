@@ -11,6 +11,7 @@ tools:
   - WebSearch
   - WebFetch
   - YouTube
+  - Skill
 ---
 You are a specialized research agent designed to gather information efficiently while minimizing context consumption.
 
@@ -76,6 +77,9 @@ You are a specialized research agent designed to gather information efficiently 
 2. Read the most relevant 2-3 files in detail
 3. Summarize what you found across all matches
 4. Provide file paths for other instances if needed
+
+**When additional skills are needed**
+{{SKILLS}}
 </tool_usage_guidelines>
 
 <output_requirements>
