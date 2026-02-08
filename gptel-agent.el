@@ -89,12 +89,26 @@ for gptel sub-agent definitions by `gptel-agent'."
   :type '(repeat directory)
   :group 'gptel-agent)
 
-(defcustom gptel-agent-skill-dirs nil
+(defcustom gptel-agent-skill-dirs '("~/.claude/skills/"
+                                    ".claude/skills/"
+                                    "~/.agents/skills" ;; codex
+                                    ".agents/skills"   ;; codex
+                                    "~/.opencode/skill/"
+                                    ".opencode/skill/"
+                                    "~/.gemini/skills/"
+                                    ".gemini/skills/")
   "Agent skill definition directories.
 
-Each directory location listed here is expected to have agent
-skills. An agent skill is a directory with atleast one file named
-\"SKILL.md\".
+Each directory listed here should contain agent skills. An agent
+skill is a directory with at least one file named \"SKILL.md\".
+
+Relative paths are resolved against the current directory and
+also against the project root when searching for skills.
+
+Relative directory locations will be take precedence over absolute
+locations. If multiple skills share the same name, the one in the
+directory listed earlier takes precedence.
+
 See https://agentskills.io for more details on agentskills."
   :type '(repeat directory)
   :group 'gptel-agent)
@@ -419,7 +433,8 @@ of the corresponding SKILL.md as a plist.")
   "Update the known skills list from `gptel-agent-skill-dirs'."
   (setq gptel-agent--skills nil)
   (mapcar (lambda (dir)
-            (dolist (skill-file (directory-files-recursively dir "SKILL\\.md"))
+            (when (file-exists-p dir)
+             (dolist (skill-file (directory-files-recursively dir "SKILL\\.md"))
               (pcase-let ((`(,name . ,skill-plist)
                            (gptel-agent-read-file skill-file)))
                 ;; validating skill definition
@@ -427,8 +442,22 @@ of the corresponding SKILL.md as a plist.")
                     (setf (alist-get name gptel-agent--skills nil nil #'string-equal)
                           (cons (file-name-directory skill-file) skill-plist))
                   (warn "Skill %s (at %s) does not have a description. Ignoring %s skill."
-                        name skill-file name)))))
-          gptel-agent-skill-dirs)
+                        name skill-file name))))))
+          ;; To preserve precedence, the list should be reversed and resolved
+          ;; relative names should be at the end.
+          (cl-loop for dir in gptel-agent-skill-dirs
+                with project-root = (when-let* ((proj (project-current))
+                                                (root (project-root proj))
+                                                (_ (not (equal root default-directory))))
+                                      root)
+                if (file-name-absolute-p dir)
+                  collect dir into absolute-dirs
+                else
+                  collect (expand-file-name dir) into relative-dirs
+                  and
+                  when project-root
+                    collect (expand-file-name dir project-root) into relative-dirs
+                finally return (append (reverse absolute-dirs) (reverse relative-dirs))))
   gptel-agent--skills)
 
 (defun gptel-agent--skills-system-message ()
