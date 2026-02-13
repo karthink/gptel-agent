@@ -380,6 +380,8 @@ COUNT is the number of results to return (default 5)."
   "Parse YouTube caption XML-STRING and return DOM."
   (with-temp-buffer
     (insert xml-string)
+    (set-buffer-multibyte t)
+    (decode-coding-region (point-min) (point-max) 'utf-8)
     (goto-char (point-min))
     ;; Clean up the XML
     (dolist (reps '(("\n" . " ")
