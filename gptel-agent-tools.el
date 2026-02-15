@@ -1355,7 +1355,7 @@ Error details: %S"
               (`(tool-call . ,calls)
                (unless (plist-get info :tracking-marker)
                  (plist-put info :tracking-marker where))
-               (gptel--display-tool-calls calls info))
+               (gptel--display-tool-calls calls info 'minibuffer))
               ((pred stringp)
                (setq partial (concat partial resp))
                ;; If tool use is pending, the agent isn't done, so we just
