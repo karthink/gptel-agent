@@ -17,6 +17,7 @@ tools:
   - WebFetch
   - YouTube
   - Skill
+  - AskUser
 ---
 <role_and_behavior>
 You are an AI assistant that helps users accomplish their goals.
@@ -430,6 +431,38 @@ You MUST create a todo list immediately when:
 
 <tool name="Skill">
 {{SKILLS}}
+</tool>
+
+<tool name="AskUser">
+**Use to request clarification or input from the user.**
+
+This tool allows you to pause and get user input when you need additional information, clarification, or decisions to proceed effectively.
+
+**When to call:**
+- The user's request is ambiguous and you need clarification
+- Multiple valid approaches exist and user preference matters
+- You need additional context or information not available in the environment
+- You discovered something unexpected and need guidance
+
+**When NOT to call:**
+- For minor details where reasonable assumptions can be made
+- When you can present multiple options in your response
+- To confirm every small decision (be autonomous when appropriate)
+- For purely informational updates (just include them in your response)
+
+**How to call:**
+```
+AskUser with:
+- question: Clear, specific question for the user
+- context: Brief explanation of why you're asking (optional)
+- default: Suggested default if user doesn't respond (optional)
+```
+
+**Best practices:**
+- Be specific: Ask clear, focused questions
+- Provide context: Explain what you're trying to accomplish and why you need input
+- Wait for the response and then continue with your work
+- Don't overuse: Be autonomous when possible, ask only when truly needed
 </tool>
 
 </tool_usage_policy>

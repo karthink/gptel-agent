@@ -53,8 +53,466 @@
 (defvar url-http-end-of-headers)
 (defvar gptel-agent--agents)
 (defvar gptel-agent--skills)
-(defconst gptel-agent--hrule
-  (propertize "\n" 'face '(:inherit shadow :underline t :extend t)))
+(defvar gptel-agent--hrule)
+(defvar gptel-agent--parent-buffer)
+(defvar gptel-agent--parent-callback)
+(defvar gptel-agent--agent-type)
+(defvar gptel-agent--task-description)
+(defvar gptel-agent--pending-user-requests)
+(defvar gptel-agent--auto-confirm-tools)
+(defvar gptel-agent--request-id-counter)
+(defvar gptel-agent-kill-finished-buffers)
+(defvar gptel-agent--active-subagents)
+
+(declare-function gptel-agent--generate-request-id "gptel-agent")
+(declare-function gptel-agent--cleanup-subagent "gptel-agent")
+(declare-function gptel-agent--task-preview-setup "gptel-agent")
+(declare-function gptel-agent--task "gptel-agent")
+
+;;; AgentFinish tool - Sub-agent signals completion
+
+(defun gptel-agent--finish (status result &optional summary)
+  "Handle AgentFinish tool call from sub-agent.
+STATUS is \"success\", \"error\", or \"partial\".
+RESULT is the text to return to the delegating agent.
+SUMMARY is an optional one-line summary.
+Communicates result back to parent and cleans up.
+
+If no parent callback exists (top-level agent), the result is inserted
+into the current buffer as a completion summary instead."
+  (let ((parent-cb gptel-agent--parent-callback)
+        (parent-buf gptel-agent--parent-buffer)
+        (agent-type gptel-agent--agent-type)
+        (description gptel-agent--task-description)
+        (agent-buffer (current-buffer)))
+    ;; Format the response
+    (let ((response
+           (format "%s result for task: %s\n\nStatus: %s\n%s%s"
+                   (capitalize (or agent-type "Agent"))
+                   (or description "unknown task")
+                   status
+                   (if summary (format "Summary: %s\n\n" summary) "\n")
+                   result)))
+      (cond
+       ;; Case 1: Has parent callback - deliver results to parent (normal sub-agent flow)
+       (parent-cb
+        ;; Nil out callback immediately to prevent double-invocation
+        ;; (the DONE handler checks this to know if AgentFinish was called)
+        (setq gptel-agent--parent-callback nil)
+        ;; Call parent callback with result
+        (when (buffer-live-p parent-buf)
+          (with-current-buffer parent-buf
+            ;; Delete the task overlay in parent buffer
+            (dolist (ov (overlays-in (point-min) (point-max)))
+              (when (and (overlay-get ov 'gptel-agent)
+                         (equal (overlay-get ov 'gptel-agent-buffer) agent-buffer))
+                (delete-overlay ov)))
+            ;; Invoke the parent callback
+            (funcall parent-cb response)))
+        ;; Clean up
+        (gptel-agent--cleanup-subagent agent-buffer (intern status))
+        ;; Return confirmation to the LLM
+        (format "Results delivered to delegating agent. Task completed with status: %s" status))
+       
+       ;; Case 2: No parent callback - top-level agent, display result in current buffer
+       (t
+        ;; Insert completion summary in current buffer
+        (goto-char (point-max))
+        (insert "\n\n"
+                (propertize "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                            'face 'shadow)
+                "\n"
+                (propertize (format "✓ Workflow Complete (Status: %s)" status)
+                            'face (if (equal status "success") 'success 'warning))
+                "\n"
+                (if summary (format "Summary: %s\n\n" summary) "\n")
+                result
+                "\n"
+                (propertize "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                            'face 'shadow)
+                "\n")
+        ;; Return confirmation to the LLM
+        (format "Workflow complete. Status: %s. Results displayed in buffer." status))))))
+
+;;; AskUser tool - Sub-agent requests user input
+
+(defun gptel-agent--ask-user (callback question &optional options context default)
+  "Handle AskUser tool call - present question to user in parent buffer.
+CALLBACK is called with the user's response when available.
+QUESTION is the question to ask.
+OPTIONS is an optional vector of suggested choices.
+CONTEXT is optional additional context for the user.
+DEFAULT is an optional default answer.
+
+If no parent buffer exists (top-level agent), the question is displayed
+in the current buffer instead."
+  (let ((agent-buffer (current-buffer))
+        (parent-buffer gptel-agent--parent-buffer)
+        (request-id (gptel-agent--generate-request-id))
+        (options-list (when options (append options nil)))) ; Convert vector to list
+    (cond
+     ;; Parent buffer exists but is dead
+     ((and parent-buffer (not (buffer-live-p parent-buffer)))
+      (funcall callback "Error: Parent buffer is no longer available."))
+     (t
+      ;; Use parent buffer if available, otherwise use current buffer (top-level agent)
+      (let ((target-buffer (or parent-buffer agent-buffer)))
+        ;; Store pending request in this agent buffer
+        (push (list :id request-id
+                    :callback callback
+                    :question question
+                    :options options-list
+                    :context context
+                    :default default
+                    :timestamp (current-time))
+              gptel-agent--pending-user-requests)
+        ;; Display in target buffer
+        (with-current-buffer target-buffer
+          (gptel-agent--display-user-request 
+           agent-buffer request-id question options-list context default))
+        ;; Don't call callback yet - it will be called when user responds
+        ;; Return nil to indicate we're waiting
+        nil)))))
+
+(defun gptel-agent--display-user-request (agent-buffer request-id question options context default)
+  "Display a user request prompt in the current (parent) buffer.
+AGENT-BUFFER is the sub-agent requesting input.
+REQUEST-ID identifies this specific request.
+QUESTION is the question to display.
+OPTIONS is a list of suggested choices.
+CONTEXT is additional context.
+DEFAULT is the default answer."
+  (let ((inhibit-read-only t)
+        (agent-name (buffer-local-value 'gptel-agent--agent-type agent-buffer))
+        (task-desc (buffer-local-value 'gptel-agent--task-description agent-buffer)))
+    (goto-char (point-max))
+    (unless (bolp) (insert "\n"))
+    (let ((start-pos (point))
+          (inner-from))
+      (insert
+       "(" (propertize "AskUser" 'font-lock-face 'font-lock-keyword-face)
+       " " (propertize (format "\"%s\"" (or agent-name "sub-agent"))
+                       'font-lock-face 'font-lock-escape-face)
+       " " (propertize (format "\"%s\"" (truncate-string-to-width
+                                         (or task-desc "task") 30 nil nil "…"))
+                       'font-lock-face 'font-lock-constant-face)
+       ")\n")
+      (setq inner-from (point))
+      ;; Question
+      (insert (propertize question 'font-lock-face 'font-lock-doc-face) "\n")
+      ;; Context
+      (when context
+        (insert "\n"
+                (propertize "Context: " 'font-lock-face 'font-lock-comment-face)
+                context "\n"))
+      ;; Options
+      (when options
+        (insert "\n"
+                (propertize "Options:\n" 'font-lock-face 'font-lock-comment-face))
+        (cl-loop for opt in options
+                 for i from 1
+                 do (insert (propertize (format "  %d. " i)
+                                        'font-lock-face 'font-lock-constant-face)
+                            opt "\n")))
+      ;; Default
+      (when default
+        (insert "\n"
+                (propertize "Default: " 'font-lock-face 'font-lock-comment-face)
+                (propertize default 'font-lock-face 'font-lock-string-face)
+                "\n"))
+      ;; Keybinding hints ABOVE the input area
+      (insert "\n"
+              (propertize "[ C-c C-c: submit | C-c C-k: cancel ]"
+                          'font-lock-face 'font-lock-comment-face)
+              "\n\n")
+      ;; Response area
+      (insert (propertize "Response: " 'font-lock-face 'font-lock-keyword-face))
+      (let ((response-start (point))
+            (overlay-end-marker (make-marker)))
+        (insert "\n")
+        ;; User types here
+        ;; Set marker at the end to track where overlay should extend
+        (set-marker overlay-end-marker (point))
+        ;; Apply block background to the content area
+        (font-lock-append-text-property
+         inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
+        ;; Store metadata as text property on the region
+        (put-text-property start-pos (point)
+                           'gptel-agent-request
+                           (list :agent-buffer agent-buffer
+                                 :request-id request-id
+                                 :response-start response-start
+                                 :default default))
+        ;; Create overlay for the input area with special keymap
+        ;; Use marker for end position so overlay extends as user types
+        (let ((ov (make-overlay start-pos overlay-end-marker)))
+          (overlay-put ov 'gptel-agent-request-overlay t)
+          (overlay-put ov 'gptel-agent-buffer agent-buffer)
+          (overlay-put ov 'gptel-request-id request-id)
+          (overlay-put ov 'keymap
+                       (let ((map (make-sparse-keymap)))
+                         (define-key map (kbd "C-c C-c") #'gptel-agent--submit-user-response)
+                         (define-key map (kbd "C-c C-k") #'gptel-agent--cancel-user-response)
+                         map)))
+        ;; Position cursor for input
+        (goto-char response-start)))))
+
+(defun gptel-agent--find-request-at-point ()
+  "Find the AskUser request overlay at or near point.
+Returns the overlay, or nil if not found."
+  (or (cl-find-if (lambda (ov) (overlay-get ov 'gptel-agent-request-overlay))
+                  (overlays-at (point)))
+      (cl-find-if (lambda (ov) (overlay-get ov 'gptel-agent-request-overlay))
+                  (overlays-in (line-beginning-position) (line-end-position)))
+      ;; Search backwards for request overlay
+      (save-excursion
+        (let ((found nil))
+          (while (and (not found) (not (bobp)))
+            (forward-line -1)
+            (setq found (cl-find-if (lambda (ov) (overlay-get ov 'gptel-agent-request-overlay))
+                                    (overlays-at (point)))))
+          found))))
+
+(defun gptel-agent--submit-user-response ()
+  "Submit the user's response to the requesting sub-agent."
+  (interactive)
+  (let* ((ov (gptel-agent--find-request-at-point)))
+    (unless ov
+      (user-error "Not in an agent request area"))
+    (let* ((agent-buffer (overlay-get ov 'gptel-agent-buffer))
+           (request-id (overlay-get ov 'gptel-request-id))
+           (props (get-text-property (overlay-start ov) 'gptel-agent-request))
+           (response-start (plist-get props :response-start))
+           (default (plist-get props :default)))
+      ;; Extract response text (from response-start to end of overlay)
+      (let ((response (string-trim
+                       (buffer-substring-no-properties
+                        response-start
+                        (overlay-end ov)))))
+        ;; Use default if response is empty
+        (when (string-empty-p response)
+          (setq response (or default "")))
+        ;; Clean up the request display
+        (let ((inhibit-read-only t))
+          (delete-region (overlay-start ov) (overlay-end ov)))
+        (delete-overlay ov)
+        ;; Insert confirmation
+        (insert (propertize (format "[Sent: %s]\n"
+                                    (truncate-string-to-width response 50 nil nil "…"))
+                            'face 'font-lock-comment-face))
+        ;; Deliver response to sub-agent
+        (gptel-agent--deliver-user-response agent-buffer request-id response)))))
+
+(defun gptel-agent--cancel-user-response ()
+  "Cancel the user request without sending a response."
+  (interactive)
+  (let* ((ov (gptel-agent--find-request-at-point)))
+    (unless ov
+      (user-error "Not in an agent request area"))
+    (let* ((agent-buffer (overlay-get ov 'gptel-agent-buffer))
+           (request-id (overlay-get ov 'gptel-request-id)))
+      ;; Clean up the request display
+      (let ((inhibit-read-only t))
+        (delete-region (overlay-start ov) (overlay-end ov)))
+      (delete-overlay ov)
+      ;; Insert cancellation notice
+      (insert (propertize "[Cancelled]\n" 'face 'font-lock-warning-face))
+      ;; Deliver cancellation to sub-agent
+      (gptel-agent--deliver-user-response 
+       agent-buffer request-id 
+       "[User cancelled the request without providing input]"))))
+
+(defun gptel-agent--deliver-user-response (agent-buffer request-id response)
+  "Deliver user RESPONSE to AGENT-BUFFER for REQUEST-ID."
+  (if (not (buffer-live-p agent-buffer))
+      (message "Warning: Sub-agent buffer no longer exists")
+    (with-current-buffer agent-buffer
+      (let ((request (cl-find request-id gptel-agent--pending-user-requests
+                              :key (lambda (r) (plist-get r :id))
+                              :test #'equal)))
+        (if (not request)
+            (message "Warning: Request %s not found in sub-agent" request-id)
+          ;; Remove from pending list
+          (setq gptel-agent--pending-user-requests
+                (cl-remove request gptel-agent--pending-user-requests))
+          ;; Call the callback with the user's response
+          (funcall (plist-get request :callback) response))))))
+
+;;; Tool confirmation via AskUser for sub-agents
+
+(defun gptel-agent--format-tool-call-for-confirmation (tool-spec arg-values)
+  "Format a tool call for user confirmation display.
+TOOL-SPEC is the gptel-tool struct.
+ARG-VALUES is a list of argument values."
+  (let ((name (gptel-tool-name tool-spec))
+        (args (gptel-tool-args tool-spec)))
+    (concat
+     (propertize (format "Tool: %s\n" name) 'face 'font-lock-keyword-face)
+     (propertize (format "Description: %s\n" 
+                         (truncate-string-to-width 
+                          (gptel-tool-description tool-spec) 80 nil nil "…"))
+                 'face 'font-lock-doc-face)
+     (propertize "Arguments:\n" 'face 'bold)
+     (cl-loop for arg in args
+              for val in arg-values
+              concat (format "  %s: %s\n"
+                             (propertize (plist-get arg :name) 'face 'font-lock-variable-name-face)
+                             (propertize (truncate-string-to-width 
+                                          (gptel--to-string val) 100 nil nil "…")
+                                         'face 'font-lock-string-face))))))
+
+(defun gptel-agent--confirm-tool-via-askuser (tool-spec arg-values callback)
+  "Request user confirmation for a tool call via AskUser.
+TOOL-SPEC is the gptel-tool struct.
+ARG-VALUES is a list of argument values.
+CALLBACK is called with the user's decision: \"yes\", \"no\", or \"yes-all\"."
+  (let* ((tool-name (gptel-tool-name tool-spec))
+         (context (gptel-agent--format-tool-call-for-confirmation tool-spec arg-values))
+         (question (format "The sub-agent wants to run tool: %s\n\nDo you want to allow this?"
+                           tool-name))
+         (options ["Yes" "No" "Yes to all (auto-approve remaining tools)"]))
+    (gptel-agent--ask-user
+     (lambda (response)
+       (let ((answer (downcase (string-trim response))))
+         (cond
+          ((or (string= answer "yes") (string= answer "1") (string= answer "y"))
+           (funcall callback "yes"))
+          ((or (string-match-p "yes to all\\|3\\|all\\|!" answer))
+           (funcall callback "yes-all"))
+          (t
+           (funcall callback "no")))))
+     question options context "Yes")))
+
+(defun gptel-agent--handle-tool-use-with-confirmation (fsm)
+  "Handle tool use in sub-agent context, using AskUser for confirmation.
+FSM is the gptel state machine.
+This replaces `gptel--handle-tool-use' for sub-agent buffers when tools
+require confirmation."
+  (when-let* ((info (gptel-fsm-info fsm))
+              (backend (plist-get info :backend))
+              ;; Only act on remaining tool calls without results
+              (tool-use (cl-remove-if (lambda (tc) (plist-get tc :result))
+                                      (plist-get info :tool-use)))
+              (ntools (length tool-use))
+              (tool-idx 0))
+    (with-current-buffer (plist-get info :buffer)
+      (let ((result-alist) (pending-confirms))
+        (mapc
+         (lambda (tool-call)
+           (let* ((args (plist-get tool-call :args))
+                  (name (plist-get tool-call :name))
+                  (arg-values nil)
+                  (tool-spec
+                   (cl-find-if
+                    (lambda (ts) (equal (gptel-tool-name ts) name))
+                    (plist-get info :tools)))
+                  (process-tool-result
+                   (lambda (result)
+                     (plist-put info :tool-success t)
+                     (let ((result (gptel--to-string result)))
+                       (plist-put tool-call :result result)
+                       (push (list tool-spec args result) result-alist))
+                     (cl-incf tool-idx)
+                     (when (>= tool-idx ntools)
+                       (gptel--inject-prompt
+                        backend (plist-get info :data)
+                        (gptel--parse-tool-results
+                         backend (plist-get info :tool-use)))
+                       (funcall (plist-get info :callback)
+                                (cons 'tool-result result-alist) info)
+                       (gptel--fsm-transition fsm)))))
+             (if (null tool-spec)
+                 (if (equal name gptel--ersatz-json-tool)
+                     (funcall (plist-get info :callback)
+                              (gptel--json-encode (plist-get tool-call :args))
+                              info)
+                   (message "Unknown tool called by model: %s" name))
+               (setq arg-values
+                     (mapcar
+                      (lambda (arg)
+                        (let ((key (intern (concat ":" (plist-get arg :name)))))
+                          (plist-get args key)))
+                      (gptel-tool-args tool-spec)))
+               ;; Check if we're in a sub-agent and tool requires confirmation
+               (let ((needs-confirm
+                      (and gptel-agent--parent-buffer
+                           gptel-confirm-tool-calls
+                           (not gptel-agent--auto-confirm-tools)
+                           (or (eq gptel-confirm-tool-calls t)
+                               (and-let* ((confirm (gptel-tool-confirm tool-spec)))
+                                 (or (not (functionp confirm))
+                                     (apply confirm arg-values)))))))
+                 (if needs-confirm
+                     ;; Use AskUser for confirmation in sub-agent
+                     (push (list tool-spec arg-values process-tool-result tool-call)
+                           pending-confirms)
+                   ;; Run tool directly
+                   (if (gptel-tool-async tool-spec)
+                       (apply (gptel-tool-function tool-spec)
+                              process-tool-result arg-values)
+                     (let ((result
+                            (condition-case errdata
+                                (apply (gptel-tool-function tool-spec) arg-values)
+                              (error (mapconcat #'gptel--to-string errdata " ")))))
+                       (funcall process-tool-result result))))))))
+         tool-use)
+        ;; Process pending confirmations one at a time
+        (when pending-confirms
+          (gptel-agent--process-pending-confirmations 
+           (nreverse pending-confirms) fsm info))))))
+
+(defun gptel-agent--process-pending-confirmations (pending-list fsm info)
+  "Process PENDING-LIST of tool calls requiring confirmation.
+FSM is the state machine, INFO is the request info."
+  (if (null pending-list)
+      ;; All confirmations processed, check if we need to transition
+      (when (plist-get info :tool-success)
+        (gptel--fsm-transition fsm))
+    (pcase-let ((`(,tool-spec ,arg-values ,process-result ,tool-call) (car pending-list)))
+      (gptel-agent--confirm-tool-via-askuser
+       tool-spec arg-values
+       (lambda (decision)
+         (pcase decision
+           ("yes"
+            ;; Run the tool
+            (if (gptel-tool-async tool-spec)
+                (apply (gptel-tool-function tool-spec)
+                       (lambda (result)
+                         (funcall process-result result)
+                         (gptel-agent--process-pending-confirmations
+                          (cdr pending-list) fsm info))
+                       arg-values)
+              (let ((result
+                     (condition-case errdata
+                         (apply (gptel-tool-function tool-spec) arg-values)
+                       (error (mapconcat #'gptel--to-string errdata " ")))))
+                (funcall process-result result)
+                (gptel-agent--process-pending-confirmations
+                 (cdr pending-list) fsm info))))
+           ("yes-all"
+            ;; Enable auto-confirm for remaining tools
+            (setq gptel-agent--auto-confirm-tools t)
+            ;; Run the tool
+            (if (gptel-tool-async tool-spec)
+                (apply (gptel-tool-function tool-spec)
+                       (lambda (result)
+                         (funcall process-result result)
+                         (gptel-agent--process-pending-confirmations
+                          (cdr pending-list) fsm info))
+                       arg-values)
+              (let ((result
+                     (condition-case errdata
+                         (apply (gptel-tool-function tool-spec) arg-values)
+                       (error (mapconcat #'gptel--to-string errdata " ")))))
+                (funcall process-result result)
+                (gptel-agent--process-pending-confirmations
+                 (cdr pending-list) fsm info))))
+           ("no"
+            ;; Reject the tool call
+            (plist-put tool-call :result "[Tool call rejected by user]")
+            (plist-put info :tool-success t)
+            (gptel-agent--process-pending-confirmations
+             (cdr pending-list) fsm info))))))))
 
 ;;; Tool use preview
 (defun gptel-agent--confirm-overlay (from to &optional no-hide)
@@ -1222,156 +1680,6 @@ the known skills as string ready to be included to the context."
                 (buffer-string)))
           (format "Could not load body of skill %s" skill))))))
 
-;;; Task tool (sub-agent)
-(defvar gptel-agent-request--handlers
-  `((WAIT ,#'gptel-agent--indicate-wait
-          ,#'gptel--handle-wait)
-    (TOOL ,#'gptel-agent--indicate-tool-call
-          ,#'gptel--handle-tool-use))
-  "See `gptel-request--handlers'.")
-
-(defun gptel-agent--task-preview-setup (arg-values _info)
-  "Preview setup for Agent.
-INFO is the tool call info plist.
-ARG-VALUES is a list: (type description prompt)"
-  (pcase-let ((from (point))
-              (`(,type ,desc ,prompt) arg-values))
-    (insert "("
-            (propertize "Agent " 'font-lock-face 'font-lock-keyword-face)
-            (propertize (prin1-to-string type)
-                        'font-lock-face 'font-lock-escape-face)
-            " " (propertize (prin1-to-string desc)
-                            'font-lock-face
-                            '(:inherit font-lock-constant-face :inherit bold))
-            "\n" (propertize (prin1-to-string prompt)
-                             'line-prefix "  "
-                             'wrap-prefix "  "
-                             'font-lock-face 'font-lock-constant-face)
-            ")\n\n")
-    (gptel-agent--confirm-overlay from (point) t)))
-
-(defun gptel-agent--indicate-wait (fsm)
-  "Display waiting indicator for agent task FSM."
-  (when-let* ((info (gptel-fsm-info fsm))
-              (info-ov (plist-get info :context))
-              (count (overlay-get info-ov 'count)))
-    (run-at-time
-     1.5 nil
-     (lambda (ov count)
-       (when (and (overlay-buffer ov)
-                  (eql (overlay-get ov 'count) count))
-         (let* ((task-msg (overlay-get ov 'msg))
-                (new-info-msg
-                 (concat task-msg
-                         (concat
-                          (propertize "Waiting... " 'face 'warning) "\n"
-                          (propertize "\n" 'face
-                                      '(:inherit shadow :underline t :extend t))))))
-           (overlay-put ov 'after-string new-info-msg))))
-     info-ov count)))
-
-(defun gptel-agent--indicate-tool-call (fsm)
-  "Display tool call indicator for agent task FSM."
-  (when-let* ((info (gptel-fsm-info fsm))
-              (tool-use (plist-get info :tool-use))
-              (ov (plist-get info :context)))
-    ;; Update overlay with tool calls
-    (when (overlay-buffer ov)
-      (let* ((task-msg (overlay-get ov 'msg))
-             (info-count (overlay-get ov 'count))
-             (new-info-msg))
-        (setq new-info-msg
-              (concat task-msg
-                      (concat
-                       (propertize "Calling Tools... " 'face 'mode-line-emphasis)
-                       (if (= info-count 0) "\n" (format "(+%d)\n" info-count))
-                       (mapconcat (lambda (call)
-                                    (gptel--format-tool-call
-                                     (plist-get call :name)
-                                     (map-values (plist-get call :args))))
-                                  tool-use)
-                       "\n" gptel-agent--hrule)))
-        (overlay-put ov 'count (+ info-count (length tool-use)))
-        (overlay-put ov 'after-string new-info-msg)))))
-
-(defun gptel-agent--task-overlay (where &optional agent-type description)
-  "Create overlay for agent task at WHERE with AGENT-TYPE and DESCRIPTION."
-  (let* ((bounds                  ;where to place the overlay, handle edge cases
-          (save-excursion
-            (goto-char where)
-            (when (bobp) (insert "\n"))
-            (if (and (bolp) (eolp))
-                (cons (1- (point)) (point))
-              (cons (line-beginning-position) (line-end-position)))))
-         (ov (make-overlay (car bounds) (cdr bounds) nil t))
-         (msg (concat
-               (unless (eq (char-after (car bounds)) 10) "\n")
-               "\n" gptel-agent--hrule
-               (propertize (concat (capitalize agent-type) " Task: ")
-                           'face 'font-lock-escape-face)
-               (propertize description 'face 'font-lock-doc-face) "\n")))
-    (prog1 ov
-      (overlay-put ov 'gptel-agent t)
-      (overlay-put ov 'count 0)
-      (overlay-put ov 'msg msg)
-      (overlay-put ov 'line-prefix "")
-      (overlay-put
-       ov 'after-string
-       (concat msg (propertize "Waiting..." 'face 'warning) "\n"
-               gptel-agent--hrule)))))
-
-(defun gptel-agent--task (main-cb agent-type description prompt)
-  "Call a gptel agent to do specific compound tasks.
-
-MAIN-CB is the main callback to return a value to the main loop.
-AGENT-TYPE is the name of the agent.
-DESCRIPTION is a short description of the task.
-PROMPT is the detailed prompt instructing the agent on what is required."
-  (gptel-with-preset
-      (nconc (list :include-reasoning nil
-                   :use-tools t
-                   :use-context nil)
-             (cdr (assoc agent-type gptel-agent--agents)))
-    (let* ((info (gptel-fsm-info gptel--fsm-last))
-           (where (or (plist-get info :tracking-marker)
-                      (plist-get info :position)))
-           (partial (format "%s result for task: %s\n\n"
-                            (capitalize agent-type) description)))
-      (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
-      (gptel-request prompt
-        :context (gptel-agent--task-overlay where agent-type description)
-        :fsm (gptel-make-fsm :handlers gptel-agent-request--handlers)
-        :callback
-        (lambda (resp info)
-          (let ((ov (plist-get info :context)))
-            (pcase resp
-              ('nil
-               (delete-overlay ov)
-               (funcall main-cb
-                        (format "Error: Task %s could not finish task \"%s\". \
-
-Error details: %S"
-                                agent-type description (plist-get info :error))))
-              (`(tool-call . ,calls)
-               (unless (plist-get info :tracking-marker)
-                 (plist-put info :tracking-marker where))
-               (gptel--display-tool-calls calls info))
-              ((pred stringp)
-               (setq partial (concat partial resp))
-               ;; If tool use is pending, the agent isn't done, so we just
-               ;; accumulate output without printing it.  We print at the end.
-               (unless (plist-get info :tool-use)
-                 (delete-overlay ov)
-                 (when-let* ((transformer (plist-get info :transformer)))
-                   (setq partial (funcall transformer partial)))
-                 (funcall main-cb partial)))
-              ('abort
-               (delete-overlay ov)
-               (funcall main-cb
-                        (format "Error: Task \"%s\" was aborted by the user. \
-%s could not finish."
-                                description agent-type))))))))))
-
 ;;; Register tool call preview functions
 
 (pcase-dolist (`(,tool-name . ,setup-fn)
@@ -1780,7 +2088,7 @@ How to use:
 (gptel-make-tool
  :name "Agent"
  :description "Launch a specialized agent to handle complex, multi-step tasks autonomously.  \
-Agents run independently and return results in one message.  \
+Agents run independently in their own buffer and MUST call AgentFinish when done.  \
 Use for open-ended searches, complex research, or when uncertain about finding results in first few tries."
  :function #'gptel-agent--task
  :args '(( :name "subagent_type"
@@ -1798,6 +2106,70 @@ Should include exactly what information the agent should return."))
  :async t
  :confirm t
  :include t)
+
+;;; Sub-agent control tools (AgentFinish, AskUser)
+
+(gptel-make-tool
+ :name "AgentFinish"
+ :description "Signal that you have completed your task and return results to the delegating agent.
+
+CRITICAL: You MUST call this tool when your task is complete.
+Without calling AgentFinish, your results will NOT be delivered to the delegating agent.
+
+Use status 'success' when the task was completed successfully.
+Use status 'error' when the task could not be completed due to an error.
+Use status 'partial' when you gathered some results but couldn't fully complete the task."
+ :function #'gptel-agent--finish
+ :args '((:name "status"
+          :type string
+          :enum ["success" "error" "partial"]
+          :description "The completion status of the task")
+         (:name "result"
+          :type string
+          :description "The result or findings to return to the delegating agent. \
+For errors, include what went wrong and any partial results.")
+         (:name "summary"
+          :type string
+          :optional t
+          :description "Optional brief one-line summary of the result"))
+ :category "gptel-agent"
+ :include t)
+
+(gptel-make-tool
+ :name "AskUser"
+ :description "Request input or clarification from the user.
+
+Use this when you need user input to proceed with your task.
+The user will be prompted in the main conversation buffer and your execution will pause until they respond.
+
+Examples of when to use:
+- Need clarification on ambiguous requirements
+- Need to choose between multiple valid approaches  
+- Need confirmation before a potentially risky action
+- Need additional information not available in context
+
+Note: Only use this when truly necessary. Try to make reasonable assumptions first."
+ :function #'gptel-agent--ask-user
+ :args '((:name "question"
+          :type string
+          :description "The question or prompt to show the user")
+         (:name "options"
+          :type array
+          :items (:type string)
+          :optional t
+          :description "Optional list of suggested options/choices for the user")
+         (:name "context"
+          :type string
+          :optional t
+          :description "Additional context to help the user understand the question")
+         (:name "default"
+          :type string
+          :optional t
+          :description "Suggested default answer if user just presses enter"))
+ :category "gptel-agent"
+ :include t
+ :async t
+ :confirm nil)
 
 (provide 'gptel-agent-tools)
 ;;; gptel-agent-tools.el ends here
