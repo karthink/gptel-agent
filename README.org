@@ -167,12 +167,12 @@ You can specify the agent name, description and tools used as YAML front-matter
 in a Markdown file, followed by the system prompt:
 
 #+begin_src markdown
-----
+---
 name: arxiv-explorer
 description: Searches ArXiv and parses results
 tools: [mcp-arxiv, WebSearch]
 pre: (lambda () (gptel-mcp-connect '(arxiv) 'sync))
-----
+---
 
 You are a specialized research agent with access to ArXiv.  Your purpose is to
 search for and gather information efficiently.
