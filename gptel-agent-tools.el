@@ -1086,11 +1086,12 @@ file.  Results are sorted by modification time."
                               (expand-file-name (substitute-in-file-name path)))))
              (t (error "Error: failed to identify grepper"))))
            (output-buffer (generate-new-buffer " *gptel-agent-grep*"))
+           (proc-name (format "gptel-agent-grep<%s>" (buffer-name output-buffer)))
            (timeout 10)
            (done nil)
            (result nil)
            (process (make-process
-                     :name "gptel-agent-grep"
+                     :name proc-name
                      :buffer output-buffer
                      :command (cons grepper args)
                      :sentinel (lambda (proc _event)
@@ -1106,6 +1107,8 @@ file.  Results are sorted by modification time."
                                        (insert (format "Error: search failed with exit-code %d.  Tool output:\n\n" exit-code))
                                        (setq result (buffer-string)))
                                       (t (setq result (buffer-string))))))))))
+      ;; Don't prompt for confirmation when killing this process (e.g., on timeout)
+      (set-process-query-on-exit-flag process nil)
       (with-timeout (timeout
                      (when (process-live-p process)
                        (kill-process process))
