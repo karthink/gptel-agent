@@ -1232,7 +1232,12 @@ the known skills as string ready to be included to the context."
           ,#'gptel--update-tool-call
           ,#'gptel--handle-tool-use)
     (TRET ,#'gptel--handle-post-tool
-          ,#'gptel--handle-tool-result))
+          ,#'gptel--handle-tool-result)
+    (DONE ,#'gptel--handle-post-insert
+          ,#'gptel--fsm-last)
+    (ERRS ,#'gptel--handle-error
+          ,#'gptel--fsm-last)
+    (ABRT ,#'gptel--handle-abort))
   "See `gptel-request--handlers'.")
 
 (defun gptel-agent--task-preview-setup (arg-values _info)
