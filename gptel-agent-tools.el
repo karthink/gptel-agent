@@ -1225,9 +1225,11 @@ the known skills as string ready to be included to the context."
 ;;; Task tool (sub-agent)
 (defvar gptel-agent-request--handlers
   `((WAIT ,#'gptel-agent--indicate-wait
+          ,#'gptel--update-wait
           ,#'gptel--handle-wait)
-    (TPRE ,#'gptel--handle-pre-tool)
-    (TOOL ,#'gptel-agent--indicate-tool-call
+(TOOL ,#'gptel--handle-pre-tool
+          ,#'gptel-agent--indicate-tool-call
+          ,#'gptel--update-tool-call
           ,#'gptel--handle-tool-use)
     (TRET ,#'gptel--handle-post-tool
           ,#'gptel--handle-tool-result))
