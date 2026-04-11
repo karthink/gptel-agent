@@ -45,6 +45,7 @@
 (require 'gptel)
 (require 'eww)
 (require 'url-http)
+(require 'gptel-agent-tools-compile)
 (eval-when-compile (require 'cl-lib))
 
 (declare-function org-escape-code-in-region "org-src")
