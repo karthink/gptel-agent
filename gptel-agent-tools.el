@@ -1108,33 +1108,59 @@ file.  Results are sorted by modification time."
   (let ((grepper (or (executable-find "rg") (executable-find "grep"))))
     (unless grepper
       (error "Error: ripgrep/grep not available, this tool cannot be used"))
-    (with-temp-buffer
-      (let* ((cmd (file-name-sans-extension (file-name-nondirectory grepper)))
-             (args
-              (cond
-               ((string= "rg" cmd)
-                (delq nil (list "--sort=modified"
-                                (and (natnump context-lines)
-                                     (format "--context=%d" context-lines))
-                                (and glob (format "--glob=%s" glob))
-                                ;; "--files-with-matches"
-                                "--max-count=1000"
-                                "--heading" "--line-number" "-e" regex
-                                (expand-file-name (substitute-in-file-name path)))))
-               ((string= "grep" cmd)
-                (delq nil (list "--recursive"
-                                (and (natnump context-lines)
-                                     (format "--context=%d" context-lines))
-                                (and glob (format "--include=%s" glob))
-                                "--max-count=1000"
-                                "--line-number" "--regexp" regex
-                                (expand-file-name (substitute-in-file-name path)))))
-               (t (error "Error: failed to identify grepper"))))
-             (exit-code (apply #'call-process grepper nil '(t t) nil args)))
-        (when (/= exit-code 0)
-          (goto-char (point-min))
-          (insert (format "Error: search failed with exit-code %d.  Tool output:\n\n" exit-code)))
-        (buffer-string)))))
+    (let* ((cmd (file-name-sans-extension (file-name-nondirectory grepper)))
+           (args
+            (cond
+             ((string= "rg" cmd)
+              (delq nil (list "--sort=modified"
+                              (and (natnump context-lines)
+                                   (format "--context=%d" context-lines))
+                              (and glob (format "--glob=%s" glob))
+                              "--max-count=1000"
+                              "--heading" "--line-number" "-e" regex
+                              (expand-file-name (substitute-in-file-name path)))))
+             ((string= "grep" cmd)
+              (delq nil (list "--recursive"
+                              (and (natnump context-lines)
+                                   (format "--context=%d" context-lines))
+                              (and glob (format "--include=%s" glob))
+                              "--max-count=1000"
+                              "--line-number" "--regexp" regex
+                              (expand-file-name (substitute-in-file-name path)))))
+             (t (error "Error: failed to identify grepper"))))
+           (output-buffer (generate-new-buffer " *gptel-agent-grep*"))
+           (proc-name (format "gptel-agent-grep<%s>" (buffer-name output-buffer)))
+           (timeout 10)
+           (done nil)
+           (result nil)
+           (process (make-process
+                     :name proc-name
+                     :buffer output-buffer
+                     :command (cons grepper args)
+                     :sentinel (lambda (proc _event)
+                                 (setq done t)
+                                 (with-current-buffer (process-buffer proc)
+                                   (let ((exit-code (process-exit-status proc)))
+                                     ;; Exit codes: 0 = matches found, 1 = no matches, 2+ = error
+                                     (cond
+                                      ((= exit-code 1)
+                                       (setq result "No matches found."))
+                                      ((>= exit-code 2)
+                                       (goto-char (point-min))
+                                       (insert (format "Error: search failed with exit-code %d.  Tool output:\n\n" exit-code))
+                                       (setq result (buffer-string)))
+                                      (t (setq result (buffer-string))))))))))
+      ;; Don't prompt for confirmation when killing this process (e.g., on timeout)
+      (set-process-query-on-exit-flag process nil)
+      (with-timeout (timeout
+                     (when (process-live-p process)
+                       (kill-process process))
+                     (setq result (format "Error: search timed out after %d seconds" timeout)))
+        (while (not done)
+          (accept-process-output process 0.1)))
+      (when (buffer-live-p output-buffer)
+        (kill-buffer output-buffer))
+      result)))
 
 ;;; Todo-write tool (task tracking)
 (defvar-local gptel-agent--todos nil)
