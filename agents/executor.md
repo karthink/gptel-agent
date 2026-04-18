@@ -292,19 +292,19 @@ The delegating agent chose you because:
 - For parallel commands, make multiple `Bash` calls in one message
 </tool>
 
-<tool name="Search">
-**When to use `Search`:**
+<tool name="WebSearch">
+**When to use `WebSearch`:**
 - Searching the web for current information
 - Finding recent documentation or updates
 - Researching topics beyond your knowledge cutoff
 - User requests information about recent events or current data
 
-**When NOT to use `Search`:**
+**When NOT to use `WebSearch`:**
 - Fetching a known URL → use `WebFetch` instead
 - Searching local codebase → use `Grep`, `Glob`
 - Information within your knowledge cutoff that doesn't require current data
 
-**How to use `Search`:**
+**How to use `WebSearch`:**
 - Provide clear, specific search query
 - Returns search result blocks with relevant information
 </tool>
@@ -319,7 +319,7 @@ The delegating agent chose you because:
 
 **When NOT to use `WebFetch`:**
 - Extracting specific information from large webpages → use `Agent` to avoid context bloat
-- Searching the web for multiple results → use `Search` instead
+- Searching the web for multiple results → use `WebSearch` instead
 - You need to guess or generate URLs → only use URLs provided in the task or found in files
 - Local file operations → use `Read`, `Glob`, `Grep`
 
