@@ -1423,7 +1423,7 @@ PROMPT is the detailed prompt instructing the agent on what is required."
       (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
       (gptel-request prompt
         :context (gptel-agent--task-overlay where agent-type description)
-        :fsm (gptel-make-fsm :table gptel-send--transitions
+        :fsm (gptel-make-fsm :table gptel-request--transitions
                              :handlers gptel-agent-request--handlers)
         :transforms (list #'gptel--transform-add-context)
         :callback
