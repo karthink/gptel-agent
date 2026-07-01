@@ -66,6 +66,7 @@
 (require 'compat)
 (require 'gptel)
 (require 'gptel-agent-tools)
+(require 'gptel-agent-loop)
 (eval-when-compile (require 'cl-lib))
 
 (declare-function yaml-parse-string "yaml")
