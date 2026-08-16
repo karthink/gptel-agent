@@ -1472,6 +1472,197 @@ Error details: %S"
                    nil nil #'equal)
         setup-fn))
 
+;;; Ask tools (user interaction)
+
+(defun gptel-agent--ask-overlay-at-point ()
+  "Return the ask overlay at point, if any."
+  (seq-find (lambda (ov) (overlay-get ov 'gptel-ask))
+            (overlays-at (point))))
+
+(defun gptel-agent--ask-make-keymap (choices)
+  "Generate keymap for CHOICES interaction with number keys."
+  (let ((map (make-sparse-keymap))
+        (count (min 9 (length choices))))
+    (dotimes (i count)
+      (let ((idx i))
+        (define-key map (kbd (format "%d" (1+ i)))
+          (lambda () (interactive) (gptel-agent--ask-select-choice idx)))
+        (define-key map (kbd (format "<kp-%d>" (1+ i)))
+          (lambda () (interactive) (gptel-agent--ask-select-choice idx)))))
+    (define-key map (kbd "RET") 'gptel-agent--ask-confirm-choice)
+    (define-key map (kbd "<return>") 'gptel-agent--ask-confirm-choice)
+    (define-key map (kbd "TAB") 'gptel-agent--ask-cycle-choice)
+    (define-key map (kbd "<tab>") 'gptel-agent--ask-cycle-choice)
+    (define-key map (kbd "n") 'gptel-agent--ask-next-choice)
+    (define-key map (kbd "p") 'gptel-agent--ask-prev-choice)
+    (define-key map (kbd "C-c C-k") 'gptel-agent--ask-cancel)
+    map))
+
+(defun gptel-agent--ask-draw-ui (question choices selection)
+  "Return UI string for QUESTION and CHOICES with SELECTION highlighted."
+  (let* ((width (min (window-body-width) 80))
+         (wrap-width (max 10 (- width 4)))
+         (header (propertize (format " 🤖 AGENT ASKS: %s"
+                                     (string-fill question wrap-width))
+                             'font-lock-face 'font-lock-keyword-face))
+         (choice-strs
+          (cl-loop for choice in choices
+                   for idx from 0
+                   collect
+                   (let* ((selected (= idx selection))
+                          (val (or (plist-get choice :value) "Unknown"))
+                          (desc (plist-get choice :description))
+                          (reco (plist-get choice :recommanded))
+                          (mark (if selected " ● " " ○ "))
+                          (face (if selected '(:inherit highlight :weight bold) 'default)))
+                     (concat
+                      (propertize mark 'font-lock-face face)
+                      (propertize (format "[%d] %s %s" (1+ idx) val (if (eq reco :json-false) "" "[RECOMMANDED]")) 'font-lock-face face)
+                      (when (and desc (not (equal desc "")))
+                        (concat "\n    "
+                                (propertize (string-fill desc wrap-width)
+                                            'font-lock-face 'font-lock-comment-face)))))))
+         (footer (propertize "\n [RET] Confirm [n/p] Down/Up [1-9] Select  [C-c C-k] Cancel"
+                             'font-lock-face '(:inherit shadow :height 0.8)))
+         gptel-agent--hrule
+         (content (concat "\n" header "\n\n" (mapconcat #'identity choice-strs "\n") footer "\n")))
+    content))
+
+(defun gptel-agent--ask-update-overlay (ov)
+  "Redraw overlay OV based on its current properties."
+  (let* ((question (overlay-get ov 'gptel-ask--question))
+         (choices (overlay-get ov 'gptel-ask--choices))
+         (selection (overlay-get ov 'gptel-ask--selection))
+         (new-text (gptel-agent--ask-draw-ui question choices selection))
+         (inhibit-read-only t)
+         (beg (overlay-start ov))
+         (end (overlay-end ov)))
+    (save-excursion
+      (goto-char beg)
+      (delete-region beg end)
+      (insert new-text)
+      (move-overlay ov beg (point)))))
+
+(defun gptel-agent--ask-select-choice (n)
+  "Select choice N and update display."
+  (interactive)
+  (when-let ((ov (gptel-agent--ask-overlay-at-point))
+             (choices (overlay-get ov 'gptel-ask--choices)))
+    (when (< n (length choices))
+      (overlay-put ov 'gptel-ask--selection n)
+      (gptel-agent--ask-update-overlay ov)
+      (let ((val (or (plist-get (nth n choices) :value) "Option")))
+        (message "Selected [%d]: %s" (1+ n) val)))))
+
+(defun gptel-agent--ask-cycle-choice (&optional prev)
+  "Cycle to next or PREV choice."
+  (interactive)
+  (when-let* ((ov (gptel-agent--ask-overlay-at-point))
+              (len (length (overlay-get ov 'gptel-ask--choices)))
+              (curr (overlay-get ov 'gptel-ask--selection)))
+    (let ((next (mod (+ curr (if prev -1 1)) len)))
+      (overlay-put ov 'gptel-ask--selection next)
+      (gptel-agent--ask-update-overlay ov))))
+
+(defun gptel-agent--ask-next-choice () (interactive) (gptel-agent--ask-cycle-choice))
+(defun gptel-agent--ask-prev-choice () (interactive) (gptel-agent--ask-cycle-choice t))
+
+(defun gptel-agent--ask-teardown (ov)
+  "Remove ask UI overlay OV completely."
+  (when (overlayp ov)
+    (let ((inhibit-read-only t)
+          (beg (overlay-start ov))
+          (end (overlay-end ov)))
+      (when (and beg end)
+        (delete-region beg end)))
+    (delete-overlay ov)))
+
+(defun gptel-agent--ask-confirm-choice ()
+  "Confirm selection and call callback."
+  (interactive)
+  (when-let* ((ov (gptel-agent--ask-overlay-at-point))
+              (callback (overlay-get ov 'gptel-ask--callback))
+              (choices (overlay-get ov 'gptel-ask--choices))
+              (sel-idx (overlay-get ov 'gptel-ask--selection))
+              (choice (nth sel-idx choices))
+              (val (plist-get choice :value)))
+    (gptel-agent--ask-teardown ov)
+    ;; Treat the appended custom option (always the last in CHOICES)
+    ;; as the free-text sentinel, instead of relying on VAL being \"Custom\".
+    (if (= sel-idx (1- (length choices)))
+        (let ((custom-response (read-string "Enter your custom response: ")))
+          (funcall callback custom-response))
+      (funcall callback val))))
+
+(defun gptel-agent--ask-cancel ()
+  "Cancel ask interaction."
+  (interactive)
+  (when-let ((ov (gptel-agent--ask-overlay-at-point)))
+    (when-let ((cb (overlay-get ov 'gptel-ask--callback)))
+      (funcall cb "User cancelled interaction."))
+    (gptel-agent--ask-teardown ov)))
+
+(defun gptel-agent--ask-question (callback question choices)
+  "Ask user QUESTION with CHOICES, calling CALLBACK with result.
+
+Always appends a custom option allowing the user to provide their own response."
+  (let* ((choices-list (append choices nil))
+         ;; Always add a custom option at the end
+         (choices-with-custom
+          (append choices-list
+                  (list (list :value "Custom"
+                              :description "Provide your own custom response"
+                              :recommanded :json-false))))
+         (ui-text (gptel-agent--ask-draw-ui question choices-with-custom 0))
+         (inhibit-read-only t))
+    (goto-char (point-max))
+    (let ((start-pos (point)))
+      (unless (bolp) (insert "\n"))
+      (insert ui-text)
+      (insert "\n")
+      (let ((ov (make-overlay start-pos (point))))
+        (overlay-put ov 'gptel-ask t)
+        (overlay-put ov 'gptel-ask--question question)
+        (overlay-put ov 'gptel-ask--choices choices-with-custom)
+        (overlay-put ov 'gptel-ask--selection 0)
+        (overlay-put ov 'gptel-ask--callback callback)
+        (overlay-put ov 'keymap (gptel-agent--ask-make-keymap choices-with-custom))
+        (overlay-put ov 'evaporate t)
+        (overlay-put ov 'priority 1000)
+        (goto-char (overlay-start ov))
+        (recenter)))))
+
+(defun gptel-agent--ask-multiple (callback questions)
+  "Ask user multiple QUESTIONS sequentially, calling CALLBACK with results."
+  (let* ((qs (append questions nil))
+         (results (make-hash-table :test 'equal))
+         (question-order nil)
+         (total (length qs)))
+    (cl-labels ((ask-next (idx)
+                  (if (>= idx total)
+                      ;; Format all Q&A pairs in order
+                      (let ((formatted-output
+                             (mapconcat
+                              (lambda (q-and-idx)
+                                (let* ((q (car q-and-idx))
+                                       (qnum (cdr q-and-idx)))
+                                  (format "Q%d: %s\nR%d: %s"
+                                          qnum q
+                                          qnum (gethash q results))))
+                              (nreverse question-order)
+                              "\n\n")))
+                        (funcall callback formatted-output))
+                    (let* ((item (nth idx qs))
+                           (q (plist-get item :question))
+                           (c (plist-get item :choices)))
+                      (push (cons q (1+ idx)) question-order)
+                      (gptel-agent--ask-question
+                       (lambda (answer)
+                         (puthash q answer results)
+                         (ask-next (1+ idx)))
+                       q (append c nil))))))
+      (ask-next 0))))
+
 ;;; All tool declarations
 
 (gptel-make-tool
@@ -1886,6 +2077,33 @@ Should include exactly what information the agent should return."))
  :category "gptel-agent"
  :async t
  :confirm t
+ :include t)
+
+(gptel-make-tool
+ :name "AskUserQuestion"
+ :function #'gptel-agent--ask-multiple
+ :description "Ask the user one or more questions sequentially.
+
+Each question in QUESTIONS should have `question' and `choices' keys.
+CHOICES must contain objects with a `value' key. An optional `description'
+key provides additional context for each choice. An optional `recommanded' key
+tells the user which choice is recommanded in this context.
+
+A \"Custom\" option is always automatically appended to each question's
+choices, allowing the user to provide their own free-text response if
+none of the predefined options are suitable."
+ :args '(( :name "questions"
+           :type array
+           :items (:type object
+                   :properties (:question (:type string)
+                                :choices (:type array
+                                          :items (:type object
+                                                  :properties (:value (:type string)
+                                                                      :description (:type string)
+                                                                      :recommanded (:type boolean))
+                                                  :required ["value"]))))))
+ :category "gptel-agent"
+ :async t
  :include t)
 
 (provide 'gptel-agent-tools)
