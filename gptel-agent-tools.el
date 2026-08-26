@@ -620,9 +620,9 @@ diagnostics."
 (defun gptel-agent--edit-files-preview-setup (arg-values _info)
   "Insert tool call preview for ARG-VALUES for \"Edit\" tool."
   (pcase-let ((from (point)) (files-affected) (description)
-              (`(,path ,old-str ,new-str-or-diff ,diffp) arg-values))
+              (`(,path ,new-str-or-diff ,old-str) arg-values))
 
-    (if (and diffp (not (eq diffp :json-false)))
+    (if (or (not old-str) (string= old-str ""))
         (progn                          ;Patch
           (insert new-str-or-diff)
           (save-excursion
@@ -637,7 +637,7 @@ diagnostics."
           (setq description "Patch")
           (require 'diff-mode)
           (gptel-agent--fontify-block 'diff-mode from (point)))
-      (when old-str                     ;Text replacement
+      (progn                     ;Text replacement
         (push path files-affected)
         (setq description "ReplaceIn")
         (insert
@@ -711,29 +711,27 @@ directory to create."
         (format "Directory %s created/verified in %s" name parent))
     (error "Error creating directory %s in %s:\n%S" name parent errdata)))
 
-(defun gptel-agent--edit-files (path &optional old-str new-str-or-diff diffp)
+(defun gptel-agent--edit-files (path new-str-or-diff &optional old-str )
   "Replace text in file(s) at PATH using either string matching or unified diff.
 
 This function supports two distinct modes of operation:
 
-1. STRING REPLACEMENT MODE (DIFFP is nil or :json-false):
+1. STRING REPLACEMENT MODE (OLD-STR is not nil and not \"\"):
    - Searches for OLD-STR in the file at PATH
    - Replaces it with NEW-STR-OR-DIFF
    - Requires OLD-STR to match exactly once (uniquely) in the file
-   - Only works on single files, not directories
+   - Only works on a single file, not directory
 
-2. DIFF/PATCH MODE (when DIFFP is non-nil and not :json-false):
+2. DIFF/PATCH MODE (when OLD-STR is nil or \"\"):
    - Applies NEW-STR-OR-DIFF as a unified diff using the `patch` command
    - Works on both single files and directories
-   - OLD-STR is ignored in this mode
    - NEW-STR-OR-DIFF can contain the diff in fenced code blocks
      (=diff or =patch)
    - Uses the -N (--forward) option to ignore already-applied patches
 
 PATH - File or directory path to modify (must be readable)
-OLD-STR - (String mode only) Exact text to find and replace
 NEW-STR-OR-DIFF - Replacement text (string mode) or unified diff (diff mode)
-DIFFP - If non-nil (and not :json-false), use diff/patch mode
+OLD-STR - If it is nil or \"\", use diff/patch mode, else it is the exact text to find and replace
 
 Error Conditions:
   - PATH not readable
@@ -753,7 +751,7 @@ Signals:
   (unless new-str-or-diff
     (error "Required argument `new_str' missing"))
 
-  (if (or (eq diffp :json-false) old-str)
+  (if (and old-str (not (string= old-str "")))
       ;; Replacement by Text
       (progn
         (when (file-directory-p path)
@@ -1647,13 +1645,13 @@ For the replacement, there are two methods:
 - Short replacements: Provide both `old_str` and `new_str`, in which case `old_str` \
 needs to exactly match one unique section of the original file, including any whitespace.  \
 Make sure to include enough context that the match is not ambiguous.  \
-The entire original string will be replaced with `new str`.
-- Long or involved replacements: set the `diff` parameter to true and provide a unified diff \
-in `new_str`. `old_str` can be ignored.
+The entire original string will be replaced with `new_str`.
+- Long or involved replacements: provide a unified diff in `new_str`. \
+set `old_str` to nil or empty.
 
 To edit multiple files,
 - provide the directory path,
-- set the `diff` parameter to true
+- set the `old_str` parameter nil or empty string
 - and provide a unified diff in `new_str`.
 
 Diff instructions:
@@ -1667,16 +1665,13 @@ To simply insert text at some line, use the \"Insert\" instead."
  :args '(( :name "path"
            :description "File path or directory to edit"
            :type string)
-         ( :name "old_str"
-           :description "Original string to replace.  If providing a unified diff, this should be false"
-           :type string
-           :optional t)
          ( :name "new_str"
            :description "Replacement string OR unified diff text"
            :type string)
-         ( :name "diff"
-           :description "Whether the replacement is a string or a diff.  `true` for a diff, `false` otherwise."
-           :type boolean))
+         ( :name "old_str"
+           :description "If \"Short replacements\", it is original string to replace, else if for \"Diff\", this should be nil or a empty string"
+           :type string
+           :optional t))
  :category "gptel-agent"
  :confirm t
  :include t)
