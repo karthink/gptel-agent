@@ -709,7 +709,8 @@ this session, which defaults to the default `gptel-agent'."
                                                 "Switch to agent preset")
                                      'face 'font-lock-doc-face))))))
           (setcar header-line-format
-                  `(:eval (funcall ,display-mode))))))))
+                  `(:eval (funcall ,display-mode))))))
+    gptel-buf))
 
 (provide 'gptel-agent)
 
