@@ -590,23 +590,36 @@ See `gptel-request' for the meanings of RESP and INFO."
        (plist-get info :status))
       (let ((inhibit-message t))
         (message "Error details:\n%S" (plist-get info :error))))
-     ((stringp resp)
-      (with-current-buffer buf
-        (goto-char pos)
-        (save-restriction
-          (if-let* ((region-markers (plist-get info :context)))
-              (apply #'narrow-to-region region-markers)
-            (narrow-to-region (point-min) pos))
-          (if (or buffer-read-only
-                  (get-char-property (point) 'read-only)
-                  (/= (previous-single-char-property-change (point) 'read-only)
-                      (point-min)))
-              (user-error "Cannot compact session: read-only text in buffer")
-            ;; Replace chat text
-            (delete-region (point-min) (point-max))
-            (insert resp)
-            (unless (eq (char-before) 10) (insert "\n"))))
-        (gptel--update-status " Ready" 'success)))
+     ((and (let stream (plist-get info :stream))
+           (or
+            (and (guard stream)
+                 (pred (eq t))
+                 done)
+            (and (pred stringp)
+                 str-response
+                 (or (guard stream)
+                     done))))
+      (when str-response
+        (plist-put info :streamed-response
+                   (concat (plist-get info :streamed-response) str-response)))
+      (when done
+        (setq resp (plist-get info :streamed-response))
+        (with-current-buffer buf
+          (goto-char pos)
+          (save-restriction
+            (if-let* ((region-markers (plist-get info :context)))
+                (apply #'narrow-to-region region-markers)
+              (narrow-to-region (point-min) pos))
+            (if (or buffer-read-only
+                    (get-char-property (point) 'read-only)
+                    (/= (previous-single-char-property-change (point) 'read-only)
+                        (point-min)))
+                (user-error "Cannot compact session: read-only text in buffer")
+              ;; Replace chat text
+              (delete-region (point-min) (point-max))
+              (insert resp)
+              (unless (eq (char-before) 10) (insert "\n"))))
+          (gptel--update-status " Ready" 'success))))
      ((and (consp resp) (eq (car resp) 'reasoning)) nil)
      (t (with-current-buffer buf        ;Tool called -- should not happen!
           (plist-put info :error "Compaction failed")
@@ -654,6 +667,7 @@ confirmation before proceeding."
                            (pcase-let ((`(,from . ,to) (car (region-bounds))))
                              (list (set-marker (make-marker) from)
                                    (set-marker (make-marker) to))))
+                :stream gptel-stream
                 :callback #'gptel-agent-compact--callback)))
     (prog1 fsm
       (when (functionp post-func)

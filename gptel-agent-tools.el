@@ -1517,6 +1517,7 @@ PROMPT is the detailed prompt instructing the agent on what is required."
         :fsm (gptel-make-fsm :table gptel-send--transitions
                              :handlers gptel-agent-request--handlers)
         :transforms (list #'gptel--transform-add-context)
+        :stream (plist-get info :stream)
         :callback
         (lambda (resp info)
           (let ((ov (plist-get info :context)))
@@ -1532,11 +1533,19 @@ Error details: %S"
                (unless (plist-get info :tracking-marker)
                  (plist-put info :tracking-marker where))
                (gptel--display-tool-calls calls info))
-              ((pred stringp)
-               (setq partial (concat partial resp))
+              ((and (let stream (plist-get info :stream))
+                    (or
+                     (and (guard stream)
+                          (pred (eq t))
+                          done)
+                     (and (pred stringp)
+                          str-response
+                          (or (guard stream)
+                              done))))
+               (setq partial (concat partial str-response))
                ;; If tool use is pending, the agent isn't done, so we just
                ;; accumulate output without printing it.  We print at the end.
-               (unless (plist-get info :tool-use)
+               (when (and done (not (plist-get info :tool-use)))
                  (delete-overlay ov)
                  (when-let* ((transformer (plist-get info :transformer)))
                    (setq partial (funcall transformer partial)))
