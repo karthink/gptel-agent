@@ -440,6 +440,187 @@ A non-unique OLD-STR must not be replaced at all."
     (should (equal (gptel-agent-test-file-content file)
                    "alpha\nbeta\ngamma\n"))))
 
+;;;; WebSearch
+
+;; URL HTTP response metadata is dynamically bound in retrieval callbacks.
+(defvar url-http-end-of-headers)
+(defvar url-http-response-status)
+
+(defun gptel-agent-test-websearch-dom (html)
+  "Parse HTML fixture HTML into a DOM."
+  (let ((native-comp-jit-compilation nil))
+    (with-temp-buffer
+      (insert html)
+      (libxml-parse-html-region (point-min) (point-max)))))
+
+(ert-deftest gptel-agent-test-websearch-ddg-organic-results-and-count ()
+  "DuckDuckGo extraction associates snippets and excludes ads/navigation."
+  (let* ((native-comp-jit-compilation nil)
+         (dom (gptel-agent-test-websearch-dom
+               "<html><body><a href='https://nav.example'>Menu</a>
+<div class='result'><a class='result__a' href='//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fa'><b>A</b> <span>title</span></a><a href='https://duplicate.example'>Other link</a><a class='result__snippet'>A <b>useful</b> <span>snippet</span></a></div>
+<div class='result result--ad'><a class='result__a' href='https://ad.example'>Ad</a></div>
+<div class='result'><a class='result__a' href='https://example.org/a'>Duplicate</a><a class='result__snippet'>duplicate</a></div>
+<div class='result'><a class='result__a' href='https://example.org/b'>B title</a><a class='result__snippet'>B snippet</a></div></body></html>"))
+         (results (gptel-agent--web-search-ddg-results dom 5)))
+    (should (= (length results) 2))
+    (should (string-match-p "A title\nA useful snippet" (car results)))
+    (should-not (string-match-p "ad.example\\|nav.example\\|duplicate.example" (apply #'concat results)))
+    (should (string-match-p "B title\nB snippet" (cadr results)))
+    (should (= (length (gptel-agent--web-search-ddg-results dom 1)) 1))))
+
+(ert-deftest gptel-agent-test-websearch-default-returns-all-page-results-and-limit-applies ()
+  "An omitted count returns every organic result on the page."
+  (let* ((native-comp-jit-compilation nil)
+         (html (concat "<html><body>"
+                       (mapconcat
+                        (lambda (n)
+                          (format "<div class='result'><a class='result__a' href='https://example.org/%d'>Title %d</a><a class='result__snippet'>Snippet %d</a></div>"
+                                  n n n))
+                        (number-sequence 1 8) "")
+                       "</body></html>"))
+         (dom (gptel-agent-test-websearch-dom html))
+         (results (gptel-agent--web-search-ddg-results dom nil)))
+    (should (= (length results) 8))
+    (should (= (length (gptel-agent--web-search-ddg-results dom 3)) 3))))
+
+(ert-deftest gptel-agent-test-websearch-generic-default-returns-all-readable-links ()
+  "A nil count leaves generic-provider readable links unlimited."
+  (let ((dom '(html nil (body nil)))
+        (native-comp-jit-compilation nil))
+    (cl-letf (((symbol-function 'eww-score-readability) #'ignore)
+              ((symbol-function 'eww-highest-readability) #'identity)
+              ((symbol-function 'shr-insert-document)
+               (lambda (_dom)
+                 (dotimes (n 8)
+                   (let ((start (point)))
+                     (insert (format "Link %d" n))
+                     (put-text-property start (point) 'shr-url
+                                        (format "https://example.org/%d" n))
+                     (insert "\n"))))))
+      (should (= (length (gptel-agent--web-search-generic-results dom nil)) 8))
+      (should (= (length (gptel-agent--web-search-generic-results dom 2)) 2)))))
+
+(ert-deftest gptel-agent-test-websearch-ddg-url-decodes-redirect-once ()
+  (should (equal (gptel-agent--web-search-ddg-url
+                  "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fa%3Fx%3Done%252Ftwo")
+                 "https://example.org/a?x=one%2Ftwo"))
+  (should (equal (gptel-agent--web-search-ddg-url
+                  "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fprotocol-relative")
+                 "https://example.org/protocol-relative"))
+  (should (equal (gptel-agent--web-search-ddg-url
+                  "/l/?uddg=https%3A%2F%2Fexample.org%2Fpath-relative")
+                 "https://example.org/path-relative"))
+  ;; A lookalike host is a valid direct URL, but never a DDG redirect.
+  (should (equal (gptel-agent--web-search-ddg-url
+                  "https://duckduckgo.com.evil.test/l/?uddg=https%3A%2F%2Fevil.test")
+                 "https://duckduckgo.com.evil.test/l/?uddg=https%3A%2F%2Fevil.test"))
+  (should (equal (gptel-agent--web-search-ddg-url
+                  "//duckduckgo.com.evil.test/l/?uddg=https%3A%2F%2Fevil.test")
+                 "https://duckduckgo.com.evil.test/l/?uddg=https%3A%2F%2Fevil.test"))
+  (should-not (gptel-agent--web-search-ddg-url
+               "https://duckduckgo.com@evil.test/l/?uddg=https%3A%2F%2Fevil.test"))
+  (should-not (gptel-agent--web-search-ddg-url "https://duckduckgo.com/l/?not-uddg=x"))
+  (should (equal (gptel-agent--web-search-ddg-url
+                  "https://example.org/a%2Fb?x=one%252Ftwo")
+                 "https://example.org/a%2Fb?x=one%252Ftwo"))
+  (should-not (gptel-agent--web-search-ddg-url "javascript:alert(1)")))
+
+(ert-deftest gptel-agent-test-websearch-count-zero-invalid-and-propagated ()
+  (let ((gptel-agent--web-search-active nil)
+        (eww-search-prefix "https://duckduckgo.com/?q=")
+        (native-comp-jit-compilation nil)
+        callback-value fetch-args)
+    (cl-letf (((symbol-function 'gptel-agent--fetch-with-timeout)
+               (lambda (&rest args) (setq fetch-args args) 'fetch-buffer)))
+      (gptel-agent--web-search-eww (lambda (value) (setq callback-value value)) "query" 1)
+      (should (= (length fetch-args) 4))
+      (with-temp-buffer
+        (insert (concat "<html><body>"
+                        "<div class='result'><a class='result__a' href='https://example.org/one'>One</a></div>"
+                        "<div class='result'><a class='result__a' href='https://example.org/two'>Two</a></div>"
+                        "</body></html>"))
+        (let ((url-http-end-of-headers (point-min)))
+          (funcall (nth 1 fetch-args)
+                   (lambda (value) (setq callback-value value))))
+        (should (string-match-p "example.org/one" callback-value))
+        (should-not (string-match-p "example.org/two" callback-value)))
+      (setq fetch-args nil)
+      (gptel-agent--web-search-eww (lambda (value) (setq callback-value value)) "query" 0)
+      (should-not fetch-args)
+      (should (string-match-p "zero results" callback-value))
+      (gptel-agent--web-search-eww (lambda (value) (setq callback-value value)) "query" -1)
+      (should-not fetch-args)
+      (should (string-match-p "nonnegative integer" callback-value)))))
+
+(ert-deftest gptel-agent-test-websearch-callback-reports-parser-failure ()
+  (let (callback-value)
+    (with-temp-buffer
+      (insert "<!doctype html><html><body>Fixture</body></html>")
+      (let ((url-http-end-of-headers (point-min))
+            (url-http-response-status nil)
+            (native-comp-jit-compilation nil))
+        (cl-letf (((symbol-function 'libxml-parse-html-region)
+                   (lambda (&rest _) (error "fixture parser error"))))
+          (gptel-agent--web-search-eww-callback
+           5 t (lambda (value) (setq callback-value value)))))
+      (should (string-match-p "could not parse search results: fixture parser error"
+                              callback-value)))))
+
+(ert-deftest gptel-agent-test-websearch-http-error-skips-parser ()
+  (let (callback-value)
+    (with-temp-buffer
+      (insert "not html")
+      (let ((url-http-response-status 503)
+            (native-comp-jit-compilation nil))
+        (cl-letf (((symbol-function 'libxml-parse-html-region)
+                   (lambda (&rest _) (error "must not parse"))))
+          (gptel-agent--web-search-eww-callback
+           5 t (lambda (value) (setq callback-value value)))))
+      (should (string-match-p "HTTP error 503" callback-value)))))
+
+(ert-deftest gptel-agent-test-websearch-ddg-no-results-reports-unsupported-page ()
+  (let (callback-value)
+    (with-temp-buffer
+      (insert "<html><body><a href='https://example.org'>Navigation</a></body></html>")
+      (let ((url-http-end-of-headers (point-min)))
+        (gptel-agent--web-search-eww-callback
+         5 t (lambda (value) (setq callback-value value))))
+      (should (string-match-p "no organic results" callback-value)))))
+
+(ert-deftest gptel-agent-test-websearch-default-count-and-other-provider ()
+  (let ((gptel-agent--web-search-active nil)
+        (native-comp-jit-compilation nil)
+        fetch-args callback-value)
+    (let ((eww-search-prefix "https://search.example/?q="))
+      (cl-letf (((symbol-function 'gptel-agent--fetch-with-timeout)
+                 (lambda (&rest args) (setq fetch-args args) 'fetch-buffer)))
+        (gptel-agent--web-search-eww (lambda (value) (setq callback-value value)) "query")
+        (should (= (length fetch-args) 4))
+        (with-temp-buffer
+          (let ((url-http-end-of-headers (point-min)))
+            (insert (concat "<html><body>"
+                            "<a href='https://example.org/one'>One</a>"
+                            "<a href='https://example.org/two'>Two</a>"
+                            "</body></html>"))
+            (funcall (nth 1 fetch-args)
+                     (lambda (value) (setq callback-value value))))
+          (should (string-match-p "example.org/one" callback-value))
+          (should (string-match-p "example.org/two" callback-value)))
+        (setq fetch-args nil)
+        (gptel-agent--web-search-eww (lambda (value) (setq callback-value value)) "query" 1)
+        (should (= (length fetch-args) 4))
+        (with-temp-buffer
+          (insert (concat "<html><body>"
+                          "<a href='https://example.org/one'>One</a>"
+                          "<a href='https://example.org/two'>Two</a>"
+                          "</body></html>"))
+          (let ((url-http-end-of-headers (point-min)))
+            (funcall (nth 1 fetch-args)
+                     (lambda (value) (setq callback-value value))))
+          (should (string-match-p "example.org/one" callback-value))
+          (should-not (string-match-p "example.org/two" callback-value)))))))
+
 (provide 'gptel-agent-test-tools)
 
 ;;; gptel-agent-test-tools.el ends here

@@ -25,7 +25,7 @@
 ;; - "Bash"           : Execute a Bash command.
 ;;
 ;; Web:
-;; - "WebSearch" : Search the web for the first five results to a query.
+;; - "WebSearch" : Search the web and return results from the current page.
 ;; - "WebFetch"  : Fetch and read the contents of a URL, and for
 ;;                 YouTube URLs get the video description and transcript.
 ;;
@@ -340,79 +340,152 @@ cleanup."
     proc-buffer))
 
 ;;;; Web search
-(defun gptel-agent--shr-next-link ()
-  "Jump to the next SHR link in the buffer.  Return jump position."
-  (let ((current-prop (get-char-property (point) 'shr-url))
-        (next-pos (point)))
-    (while (and (not (eobp))
-                (setq next-pos
-                      (or (next-single-property-change (point) 'shr-url)
-                          (point-max)))
-                (let ((next-prop (get-char-property next-pos 'shr-url)))
-                  (or (equal next-prop current-prop)
-                      (equal next-prop nil))))
-      (goto-char next-pos))
-    (goto-char next-pos)))
-
 (defvar gptel-agent--web-search-active nil)
 
+(defun gptel-agent--web-search-url-parts (url)
+  "Return parsed URL parts for absolute HTTP(S) URL, or nil."
+  (when (stringp url)
+    (let ((parts (ignore-errors (url-generic-parse-url url))))
+      (and parts (member (url-type parts) '("http" "https"))
+           (url-host parts) (not (url-user parts)) parts))))
+
+(defun gptel-agent--web-search-ddg-host-p (host)
+  "Return non-nil for an exact known DuckDuckGo hostname HOST."
+  (member (downcase host) '("duckduckgo.com" "www.duckduckgo.com"
+                            "html.duckduckgo.com")))
+
+(defun gptel-agent--web-search-ddg-p ()
+  "Return non-nil when `eww-search-prefix' targets DuckDuckGo."
+  (let ((parts (gptel-agent--web-search-url-parts eww-search-prefix)))
+    (and parts (not (null (gptel-agent--web-search-ddg-host-p (url-host parts)))))))
+
+(defun gptel-agent--web-search-valid-url (url)
+  "Return URL if it is an HTTP(S) URL; leave its percent escapes intact."
+  (and (gptel-agent--web-search-url-parts url) url))
+
+(defun gptel-agent--web-search-ddg-url (url)
+  "Resolve a DuckDuckGo uddg redirect, decoding its value exactly once."
+  (let* ((protocol-relative-p (and (stringp url) (string-match-p "\\`//" url)))
+         (local-path-p (and (stringp url) (string-match-p "\\`/l/\\?" url)))
+         (parts (and (stringp url) (not local-path-p)
+                     (gptel-agent--web-search-url-parts
+                      (if protocol-relative-p (concat "https:" url) url))))
+         (host (and parts (url-host parts)))
+         (path (and parts (url-filename parts)))
+         (ddg-redirect-p
+          (or (and parts (gptel-agent--web-search-ddg-host-p host)
+                   (string-match-p "\\`/l/\\(?:\\?\\|\\'\\)" path))
+              local-path-p)))
+    (if (not ddg-redirect-p)
+        (gptel-agent--web-search-valid-url
+         (if protocol-relative-p (concat "https:" url) url))
+      (when (string-match "[?&]uddg=\\([^&]*\\)" url)
+        (gptel-agent--web-search-valid-url
+         (url-unhex-string (subst-char-in-string ?+ ? (match-string 1 url))))))))
+
+(defun gptel-agent--web-search-class-nodes (node class)
+  "Return descendant DOM nodes whose class list contains CLASS."
+  (let (found)
+    (cl-labels ((walk (n)
+                  (when (consp n)
+                    (let ((classes (and (listp (cadr n)) (cdr (assq 'class (cadr n))))))
+                      (when (and (stringp classes) (member class (split-string classes)))
+                        (push n found)))
+                    (dolist (child (cddr n)) (walk child)))))
+      (walk node))
+    (nreverse found)))
+
+(defun gptel-agent--web-search-ddg-results (dom count)
+  "Extract organic DuckDuckGo results from DOM, limited to COUNT when non-nil."
+  (let (results seen)
+    (dolist (entry (gptel-agent--web-search-class-nodes dom "result"))
+      (let* ((classes (cdr (assq 'class (cadr entry))))
+             (title-node (car (gptel-agent--web-search-class-nodes entry "result__a")))
+             (snippet-node (car (gptel-agent--web-search-class-nodes entry "result__snippet")))
+             (url (and title-node (gptel-agent--web-search-ddg-url
+                                   (dom-attr title-node 'href))))
+             (title (and title-node
+                         (string-trim
+                          (replace-regexp-in-string
+                           "[[:space:]]+" " " (dom-texts title-node)))))
+             (snippet (and snippet-node
+                           (string-trim
+                            (replace-regexp-in-string
+                             "[[:space:]]+" " " (dom-texts snippet-node))))))
+        (when (and (or (null count) (< (length results) count))
+                   (not (and (stringp classes) (string-match-p "\\bresult--ad\\b" classes)))
+                   url (not (member url seen)) (not (string-empty-p title)))
+          (push url seen)
+          (push (format "%s\n%s%s\n\n----\n" url title
+                        (if (and snippet (not (string-empty-p snippet)))
+                            (concat "\n" snippet) "")) results))))
+    (nreverse results)))
+
+(defun gptel-agent--web-search-generic-results (dom count)
+  "Extract readable links from other providers, limited to COUNT when non-nil."
+  (let (results seen)
+    (eww-score-readability dom)
+    (with-temp-buffer
+      (shr-insert-document (eww-highest-readability dom))
+      (goto-char (point-min))
+      (while (and (not (eobp)) (or (null count) (< (length results) count)))
+        (let* ((start (point)) (url (get-char-property start 'shr-url))
+               (next (or (next-single-property-change start 'shr-url) (point-max)))
+               (text (string-trim (buffer-substring-no-properties start next))))
+          (when (and (gptel-agent--web-search-valid-url url) (not (string-empty-p text))
+                     (not (member url seen)))
+            (push url seen) (push (format "%s\n%s\n\n----\n" url text) results))
+          (goto-char (max (1+ start) next)))))
+    (nreverse results)))
+
 (defun gptel-agent--web-search-eww (tool-cb query &optional count)
-  "Search the web using eww's default search engine (usually DuckDuckGo).
+  "Search with eww. COUNT, when non-nil, must be a nonnegative integer.
+A nil COUNT returns all available results on the returned page; no pagination
+is performed.  TOOL-CB receives formatted text."
+  (cond
+     ((not (or (null count) (and (integerp count) (>= count 0))))
+      (funcall tool-cb "Error: WebSearch count must be a nonnegative integer."))
+     ((and count (zerop count))
+      (funcall tool-cb "[WebSearch: zero results requested.]"))
+     (t
+      (setq gptel-agent--web-search-active
+            (cl-delete-if-not (lambda (buf) (and (buffer-live-p buf)
+                                                 (process-live-p (get-buffer-process buf))))
+                              gptel-agent--web-search-active))
+      (if (>= (length gptel-agent--web-search-active) 2)
+          (progn (message "Web search: waiting for turn")
+                 (run-at-time 5 nil #'gptel-agent--web-search-eww tool-cb query count))
+        (push (gptel-agent--fetch-with-timeout
+               (concat eww-search-prefix (url-hexify-string query))
+               (apply-partially #'gptel-agent--web-search-eww-callback
+                                count (gptel-agent--web-search-ddg-p))
+               tool-cb (format "Web search for \"%s\"" query))
+              gptel-agent--web-search-active)))))
 
-Call TOOL-CB with the results as a string.  QUERY is the search string.
-COUNT is the number of results to return (default 5)."
-  ;; No more than two active searches at one time
-  (setq gptel-agent--web-search-active
-        (cl-delete-if-not
-         (lambda (buf) (and (buffer-live-p buf)
-                       (process-live-p (get-buffer-process buf))))
-         gptel-agent--web-search-active))
-  (if (>= (length gptel-agent--web-search-active) 2)
-      (progn (message "Web search: waiting for turn")
-             (run-at-time 5 nil #'gptel-agent--web-search-eww
-                          tool-cb query count))
-    (push (gptel-agent--fetch-with-timeout
-           (concat eww-search-prefix (url-hexify-string query))
-           #'gptel-agent--web-search-eww-callback
-           tool-cb (format "Web search for \"%s\"" query))
-          gptel-agent--web-search-active)))
-
-(defun gptel-agent--web-search-eww-callback (cb)
-  "Extract website text and run callback CB with it."
-  (let ((count 5) (results)
-        (body-start (if url-http-end-of-headers
-                        (save-excursion
-                          (goto-char url-http-end-of-headers)
-                          (point))
-                      (goto-char (point-min)) (forward-paragraph)
-                      (point))))
-    ;; Bare NUL scan: the body is parsed as HTML below when not binary.
-    (if (save-excursion (goto-char body-start)
-                        (skip-chars-forward "^\0")
-                        (not (eobp)))
-        (setq results
-              (list "[WebSearch: binary content in search results page.]"))
-      ;; NOTE: libxml2 replaces unencodable chars with placeholders
-      (let ((dom (libxml-parse-html-region body-start (point-max)))
-            (result-count 0))
-        (eww-score-readability dom)
-        (with-temp-buffer
-          (shr-insert-document (eww-highest-readability dom))
-          (goto-char (point-min))
-          (while (and (not (eobp)) (< result-count count))
-            (let ((pos (point))
-                  (url (get-char-property (point) 'shr-url))
-                  (next-pos (gptel-agent--shr-next-link)))
-              (when-let* (((stringp url))
-                          (idx (string-search "http" url))
-                          (url-fmt (url-unhex-string (substring url idx))))
-                (cl-incf result-count)
-                (push (concat url-fmt "\n\n"
-                              (string-trim
-                               (buffer-substring-no-properties pos next-pos))
-                              "\n\n----\n")
-                      results)))))))
-    (funcall cb (apply #'concat (nreverse results)))))
+(defun gptel-agent--web-search-eww-callback (count ddg-p cb)
+  "Parse a result page and call CB with text or a useful failure notice."
+  (let ((status (and (boundp 'url-http-response-status)
+                     url-http-response-status)))
+    (if (and (numberp status) (not (<= 200 status 299)))
+        (funcall cb (format "[WebSearch: HTTP error %d while fetching search results.]" status))
+      (let* ((body-start (if (and (boundp 'url-http-end-of-headers)
+                              url-http-end-of-headers)
+                         (save-excursion (goto-char url-http-end-of-headers) (point))
+                       (goto-char (point-min)) (forward-paragraph) (point)))
+         (output (condition-case err
+                     (if (save-excursion (goto-char body-start) (skip-chars-forward "^\0")
+                                         (not (eobp)))
+                         "[WebSearch: binary content in search results page.]"
+                       (let* ((dom (libxml-parse-html-region body-start (point-max)))
+                              (items (if ddg-p (gptel-agent--web-search-ddg-results dom count)
+                                       (gptel-agent--web-search-generic-results dom count))))
+                         (if items (apply #'concat items)
+                           (if ddg-p
+                               "[WebSearch: no organic results found; DuckDuckGo markup may be unsupported or blocked.]"
+                             "[WebSearch: no readable results found on this search page.]"))))
+                   (error (format "[WebSearch: could not parse search results: %s]"
+                                  (error-message-string err))))))
+        (funcall cb output)))))
 
 ;;;; Read URLs
 (defun gptel-agent--read-url (tool-cb url)
@@ -1654,17 +1727,17 @@ demonstrate something to the user."
 (gptel-make-tool
  :name "WebSearch"
  :function 'gptel-agent--web-search-eww
- :description "Search the web for the first five results to a query.  The query can be an arbitrary string.  Returns the top five results from the search engine as a list of plists.  Each object has the keys `:url` and `:excerpt` for the corresponding search result.
+ :description "Search the web using eww's configured search engine (usually DuckDuckGo). Returns all available results from the current page by default, or up to COUNT results when specified. Results are formatted text containing URLs, titles, and snippets when available. COUNT may be zero; no pagination is performed.
 
-This tool uses the Emacs web browser (eww) with its default search engine (typically DuckDuckGo) to perform searches. No API key is required.
+DuckDuckGo results are extracted from organic result entries; other configured providers use best-effort readable-link extraction. If DuckDuckGo markup is unsupported or blocked, the tool reports that rather than presenting navigation links as search results.
 
-If required, consider using the url as the input to the `Read` tool to get the contents of the url.  Note that this might not work as the `Read` tool does not handle javascript-enabled pages."
+Use the WebFetch tool to read a result URL. WebFetch returns readable text and may not work for JavaScript-only pages."
  :args '((:name "query"
                 :type string
                 :description "The natural language search query, can be multiple words.")
          (:name "count"
                 :type integer
-                :description "Number of results to return (default 5)"
+                :description "Optional maximum number of results to return from the current page"
                 :optional t))
  :include t
  :async t
