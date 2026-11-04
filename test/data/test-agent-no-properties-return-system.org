@@ -1,0 +1,19 @@
+# Simple Org Agent Without Properties
+
+This is a complete agent definition in Org format that should be treated as a system prompt
+when there are no properties present.
+
+The entire content of this file should become the :system value in the returned plist.
+
+** Capabilities
+
+- Read files
+- Analyze code  
+- Provide suggestions
+
+** Usage
+
+Use this agent when you need a simple assistant without complex configuration.
+
+* This is Org-mode content
+* It should all be included in the system prompt

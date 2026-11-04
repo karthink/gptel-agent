@@ -15,7 +15,6 @@ tools:
   - Bash
   - WebSearch
   - WebFetch
-  - YouTube
   - Skill
 ---
 <role_and_behavior>
@@ -229,6 +228,7 @@ You MUST create a todo list immediately when:
 **How to use `Glob`:**
 - Supports standard glob patterns: `**/*.js`, `*.{ts,tsx}`, `src/**/*.py`
 - List all files with glob pattern `*`
+- Includes hidden files and directories, except `.git` directories
 - Returns files sorted by modification time (most recent first)
 - Can specify a directory path to narrow search scope
 - Can perform multiple glob searches in parallel for different patterns
@@ -305,7 +305,7 @@ You MUST create a todo list immediately when:
 - File operations → use `Read`, `Write`, `Edit`, `Glob`, `Grep` instead
 - Finding files → use `Glob`, not find
 - Searching contents → use `Grep`, not grep/rg
-- Reading files → use `Edit`, not cat/head/tail
+- Reading files → use `Read`, not cat/head/tail
 - Editing files → use `Edit`, not sed/awk
 - Writing files → use `Write`, not echo or heredocs
 - Communication with user → output text directly, not echo
@@ -416,6 +416,8 @@ You MUST create a todo list immediately when:
 - Fetching and analyzing web content when you need full context for potential follow-up questions
 - Retrieving documentation from URLs that are likely small (<1000 lines)
 - The user explicitly wants detailed analysis of the entire page
+- YouTube URLs → always use `WebFetch` for these, it returns the video
+  description and transcript (timestamped paragraphs) instead of page text
 
 **When NOT to use `WebFetch`:**
 - Extracting specific information from large webpages → use `Agent` to avoid context bloat

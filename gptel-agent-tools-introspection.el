@@ -57,9 +57,14 @@
 (defun gptel-agent--introspect-symbol-in-manual (symbol)
   "Return the Info documentation for SYMBOL, if it exists."
   (when-let* ((symbol (intern-soft symbol)))
-    (save-window-excursion
+    (let* (buf
+           (remember (lambda (buffer alist)
+                       (display-buffer-no-window (setq buf buffer) alist)))
+           (display-buffer-overriding-action
+            `(,remember (allow-no-window . t))))
       (info-lookup-symbol symbol #'emacs-lisp-mode)
-      (buffer-substring-no-properties (point-min) (point-max)))))
+      (with-current-buffer buf
+        (buffer-substring-no-properties (point-min) (point-max))))))
 
 (defun gptel-agent--introspect-library-source (library-name)
   "Return the source code of LIBRARY-NAME as a string."
@@ -122,19 +127,6 @@ You can also learn about what kind of package management they are using
 and which packages are likely shadowed by their Elisp dependency
 manager.  The location of default packages can tell you about the user's
 Emacs installation.")
-
-(gptel-make-tool
- :function (lambda () (mapconcat #'symbol-name features "\n"))
- :name "features"
- :include t
- :category "introspection"
- :args nil
- :description "Return the list of loaded features.
-This tool can be used to see what packages are already loaded in the
-running Emacs.  Use this to understand the user's typical set of
-packages and typical usage patterns.  Especially if the solution depends
-on the user's choice of packages, you will want to look at the features
-and load paths.")
 
 (gptel-make-tool
  :function (lambda ()

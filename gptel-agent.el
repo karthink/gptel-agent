@@ -30,7 +30,8 @@
 ;; LLM, to autonomously perform tasks.
 ;;
 ;; It has access to
-;; - the web (via basic web search, URL fetching and YouTube video metadata),
+;; - the web (via basic web search and URL fetching, including YouTube video
+;;   descriptions and transcripts),
 ;; - local files (read/write/edit),
 ;; - the state of Emacs (documentation and Elisp evaluation),
 ;; - and Bash, if you are in a POSIX-y environment.
@@ -76,6 +77,7 @@
 (declare-function org-entry-properties "org")
 (defvar org-inhibit-startup)
 (defvar project-prompter)
+(defvar gptel-org-branching-context)
 
 ;;; User options
 (defcustom gptel-agent-dirs
@@ -114,6 +116,41 @@ directory listed earlier takes precedence.
 
 See https://agentskills.io for more details on agentskills."
   :type '(repeat directory)
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-compact-prompt
+  "Purpose: To create a comprehensive record that ensures no important details or context are lost between sessions.
+This process prioritizes thoroughness over brevity to retain all critical information.
+
+The contents of the summary depends on the type of the conversation:
+
+## Coding or technical sessions working towards specific goals
+
+- Overall purpose and goals of the interaction
+- Important progress made in the current session
+- Mistakes and dead-ends that should be avoided in subsequent steps
+- Technical details that need to be preserved
+- Key decisions and architectural changes
+- Unfinished tasks and actionable next steps
+
+Provide as much detail as necessary, and err on the side of providing too much information.  Be thorough.
+
+## Exploratory conversations or non-technical sessions
+
+Summarize the chat in a way that allows any LLM to continue the conversation based on the summary.
+
+- Emphasize topics covered in the conversation
+- In the order in which they were covered.  Retain the narrative flow of the conversation in your summary.
+- Include points of disagreement with the user
+- Be sure to include any explicit instructions provided by the user in their turns.
+  You are expected to continue to follow these
+
+Provide as much detail as necessary, and err on the side of providing too much information.  Be thorough."
+  "System prompt for session compaction used by gptel agent.
+
+Can be a string or a function that returns a string."
+  :type '(choice (string :tag "Custom prompt string")
+                 (function :tag "Function that returns prompt string"))
   :group 'gptel-agent)
 
 ;;; State update
@@ -178,7 +215,8 @@ Returns an alist of (agent-name . file-path)."
   (setq gptel-agent--skills nil)
   (mapc (lambda (dir)
           (when (file-directory-p dir)
-            (dolist (skill-file (directory-files-recursively dir "SKILL\\.md"))
+            (dolist (skill-file (directory-files-recursively
+                                 dir "SKILL\\.md$" nil nil t))
               (pcase-let ((`(,name . ,skill-plist) ;loading only metadata
                            (gptel-agent-read-file skill-file nil t)))
                 ;; validating skill definition
@@ -353,14 +391,43 @@ opening delimiter '---' found but no closing delimiter" file-path))
                               :object-type 'plist
                               :object-key-type 'keyword
                               :sequence-type 'list)))
+            ;; Normalize property types and handle special keys.
             (let ((tail parsed-yaml))
               (while tail
                 (let ((key (pop tail))
                       (val (pop tail)))
                   (pcase key
+                    ;; :pre and :post are Elisp expressions as strings.
                     ((or :pre :post) (plist-put parsed-yaml key (eval (read val) t)))
+                    ;; :parents is a YAML list of strings read as a list.
                     (:parents (plist-put parsed-yaml key
-                                         (mapcar #'intern (ensure-list (read val)))))))))
+                                         (mapcar #'intern (ensure-list val))))
+                    ;; :context and :tools: If a string (single-line YAML), split
+                    ;; by spaces. If already a list (YAML sequence), keep as-is.
+                    ((or :context :tools)
+                     (plist-put parsed-yaml key
+                                (if (listp val) val (split-string val))))
+                    ;; Numeric properties: YAML already handles these correctly
+                    ;; (numbers become numbers), so no conversion needed.
+                    ;; Boolean properties: YAML true -> t, YAML false -> :false.
+                    ((or :stream :track-media :track-response
+                         :org-convert-response)
+                     (plist-put parsed-yaml key (unless (eq val :false) val)))
+                    ;; Include-reasoning can be true/t, false/nil, "ignore",
+                    ;; or a string (buffer name).
+                    (:include-reasoning
+                     (plist-put parsed-yaml key (pcase val
+                                                  (:false nil)
+                                                  ("ignore" 'ignore)
+                                                  (_ val))))
+                    ;; Symbol properties (always a symbol or nil)
+                    ((or :use-context :include-tool-results :confirm-tool-calls
+                         :use-tools :cache :model)
+                     (plist-put parsed-yaml key
+                                (pcase val
+                                  (:false nil)
+                                  ((pred stringp) (intern val))
+                                  (_ val))))))))
 
             ;; Validate all keys in the parsed YAML
             (let ((current-plist parsed-yaml))
@@ -440,15 +507,36 @@ Signals an error if:
                                (forward-line 1))
                              (point))))
 
-          ;; Process each property
+          ;; Normalize property types and handle special keys.
           (dolist (pair props-alist)
             (let* ((key-str (downcase (car pair)))
                    (key-sym (intern (concat ":" key-str)))
                    (value (cdr pair)))
 
               (pcase key-sym
-                (:context (setq value (split-string value)))
-                (:tools (setq value (split-string value))))
+                ;; Properties that should remain as lists
+                ((or :context :tools)
+                 (setq value (split-string value)))
+                ;; Numeric properties
+                ((or :temperature :max-tokens :num-messages-to-send)
+                 (setq value (unless (string-equal value "nil")
+                               (string-to-number value))))
+                ;; Include-reasoning can also be a string (buffer name)
+                (:include-reasoning (setq value (pcase value
+                                                  ("nil" nil)
+                                                  ("t" t)
+                                                  ("ignore" 'ignore)
+                                                  (_ value))))
+                ;; Boolean properties
+                ((or :stream :track-media :track-response :org-convert-response)
+                 (setq value (pcase value
+                               ("nil" nil)
+                               ("t" t)
+                               (_ value))))
+                ;; Symbol properties
+                ((or :use-context :include-tool-results :confirm-tool-calls
+                     :use-tools :cache :model)
+                 (setq value (intern value))))
 
               ;; Skip CATEGORY property (added automatically by Org)
               (unless (string-equal key-str "category")
@@ -483,6 +571,95 @@ Signals an error if:
 
 ;;; Commands
 
+(defun gptel-agent-compact--callback (resp info)
+  "Callback for `gptel-agent-compact'.
+
+See `gptel-request' for the meanings of RESP and INFO."
+  (let ((buf (plist-get info :buffer))
+        (pos (plist-get info :position)))
+    (cond
+     ((not (buffer-live-p buf))
+      (user-error "Session buffer \"%s\" is no longer available"
+                  (buffer-name buf)))
+     ((null resp)                       ;error
+      (with-current-buffer buf
+        (gptel--update-status
+         (format " Error: %s" (gptel--to-string (plist-get info :status))) 'error))
+      (message
+       "Prompt compaction failed with error %S, see *Messages* buffer for details"
+       (plist-get info :status))
+      (let ((inhibit-message t))
+        (message "Error details:\n%S" (plist-get info :error))))
+     ((stringp resp)
+      (with-current-buffer buf
+        (goto-char pos)
+        (save-restriction
+          (if-let* ((region-markers (plist-get info :context)))
+              (apply #'narrow-to-region region-markers)
+            (narrow-to-region (point-min) pos))
+          (if (or buffer-read-only
+                  (get-char-property (point) 'read-only)
+                  (/= (previous-single-char-property-change (point) 'read-only)
+                      (point-min)))
+              (user-error "Cannot compact session: read-only text in buffer")
+            ;; Replace chat text
+            (delete-region (point-min) (point-max))
+            (insert resp)
+            (unless (eq (char-before) 10) (insert "\n"))))
+        (gptel--update-status " Ready" 'success)))
+     ((and (consp resp) (eq (car resp) 'reasoning)) nil)
+     (t (with-current-buffer buf        ;Tool called -- should not happen!
+          (plist-put info :error "Compaction failed")
+          (gptel--update-status " Error: Compaction failed" 'error)
+          (message "Prompt compaction stalled or failed"))))))
+
+(defun gptel-agent-compact (&optional extra post-func confirm)
+  "Compact contents of buffer up to point, or region if active.
+
+This will replace buffer text with an LLM generated summary.  For prompt
+compaction instructions see `gptel-agent-compact-prompt'.
+
+With prefix argument, prompt for EXTRA instructions.
+
+POST-FUNC is a function to run after the compaction is complete.  It is
+called with one argument, the INFO plist of the compaction request.
+This plist contains request details, including the :error key which is
+non-nil if the compaction request failed.  See `gptel-request' for more
+information about INFO.
+
+When CONFIRM is non-nil (the default in interactive use), seek
+confirmation before proceeding."
+  (interactive
+   (list (and current-prefix-arg
+              (read-string "Extra compaction instructions: "))
+         nil t))
+  (when confirm
+    (unless (y-or-n-p
+             (concat "Prompt compaction will replace all buffer text "
+                     (if (use-region-p) "in the region." "before point.")
+                     "  Proceed?"))
+      (user-error "Prompt compaction canceled")))
+  (gptel--update-status " Compacting..." 'warning)
+  (let* ((gptel-include-reasoning)
+         (gptel-use-tools)
+         (gptel-org-branching-context)
+         (fsm (gptel-request nil
+                :system
+                (if extra
+                    (concat (gptel--parse-directive gptel-agent-compact-prompt t)
+                            "\n\nAdditional instructions:\n\n" extra)
+                  gptel-agent-compact-prompt)
+                :transforms (list 'gptel--transform-add-context)
+                :context (when (use-region-p)
+                           (pcase-let ((`(,from . ,to) (car (region-bounds))))
+                             (list (set-marker (make-marker) from)
+                                   (set-marker (make-marker) to))))
+                :callback #'gptel-agent-compact--callback)))
+    (prog1 fsm
+      (when (functionp post-func)
+        (let ((info (gptel-fsm-info fsm)))
+          (plist-put info :post (cons post-func (plist-get info :post))))))))
+
 ;;;###autoload
 (defun gptel-agent (&optional project-dir agent-preset)
   "Start a `gptel-agent' session in the current project.
@@ -511,8 +688,6 @@ this session, which defaults to the default `gptel-agent'."
       (gptel--apply-preset              ;Apply the gptel-agent preset
        (or agent-preset 'gptel-agent)
        (lambda (sym val) (set (make-local-variable sym) val)))
-      (unless gptel-max-tokens          ;Agent tasks typically need
-        (setq gptel-max-tokens 8192))   ;a higher than usual value
       (when gptel-use-header-line
         (let* ((agent-mode t)
                (switch-mode

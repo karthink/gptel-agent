@@ -1,0 +1,57 @@
+# -*- mode: org; -*-
+
+* 0.0.5-pre
+
+** New features and UI changes
+
+- gptel-agent now works over TRAMP.  This means it can run processes on
+  remote servers, grep and edit files and so on without the need to
+  install Emacs or an agent harness.  This involves calling command line
+  programs on the remote, so it requires a POSIX-y remote environment.
+
+- New user option ~gptel-agent-preset~ to specify additional gptel
+  settings for sub-agents.  This is a preset that applies to all
+  sub-agent calls, before any agent-specific settings.
+
+  Its main purpose is to allow using a cheaper/smaller (or larger!)
+  model for sub-agent tasks, which is a common need depending on the
+  estimated difficulty of such tasks.  Of course, this is a gptel preset
+  so you are not restricted to specifying a backend/model -- any gptel
+  setting is supported.
+
+  It can be set to a preset name (a symbol) or a plist spec, for example:
+  #+begin_src emacs-lisp
+  (gptel-make-preset 'lite              ;elsewhere
+    :backend "Gemini"
+    :model 'gemini-flash-lite-latest)
+
+  ;; Apply the "lite" preset to sub-agent calls
+  (setq gptel-agent-preset 'lite)
+  #+end_src
+  or just
+  #+begin_src emacs-lisp
+  (setq gptel-agent-preset
+        '(:backend "Gemini" :model gemini-flash-lite-latest))
+  #+end_src
+
+- New command ~gptel-agent-compact~ to compact/summarize a conversation
+  and free up the context window.  It works on the buffer up to the
+  cursor position or on the active region, so you can compact a part of
+  a conversation if desired.  Currently this must be invoked manually,
+  but auto-compaction is planned for the future.
+
+  Be warned: this is lossy and modifies the chat buffer!
+
+  The prompt used for compaction is customizable, see
+  ~gptel-agent-compact-prompt~.  You can also specify additional
+  compaction instructions interactively by calling ~gptel-agent-compact~
+  with a prefix argument.
+
+  This command is experimental, and the implementation of prompt
+  compaction might change in the future.
+
+** Notable bug fixes
+
+# Local Variables:
+# fill-column: 72
+# End:
