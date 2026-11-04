@@ -242,15 +242,19 @@ The delegating agent chose you because:
 **When NOT to use `Edit`:**
 - Creating brand new files → use `Write`
 - You haven't read the file yet → must `Read` first (tool will error)
-- The old_string is not unique and you want to replace all occurrences → use `replace_all: true`
 
-**How to use `Edit`:**
+**How to use `Edit` for SINGLE replacement:**
 - MUST `Read` the file first (required, tool will error otherwise)
-- Provide exact `old_string` to match (including proper indentation from file content)
+- Provide exact `old_string` to match (including proper indentation from file content, not line number prefixes)
 - Provide `new_string` as replacement (must be different from old_string)
-- The edit will FAIL if old_string is not unique unless `replace_all: true` is set
-- Preserve exact indentation from the file content
+- The edit will FAIL if old_string is not unique
+- Preserve exact indentation from the file content (ignore line number prefixes from `Read` output)
 - Always prefer editing existing files over creating new ones
+
+**How to use `Edit` for MULTIPLE replacement:**
+- Leave `old_string` nil or as empty string
+- Provide `new_string` as diff within fenced code blocks (=diff or =patch) and be in unified format
+- There must be the file paths within the diff. e.g. ('--- a/filename' '+++ b/filename') are appropriate for the 'path'.
 </tool>
 
 <tool name="Write">
