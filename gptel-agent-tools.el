@@ -84,6 +84,27 @@ parameters take precedence over this value."
                  (plist  :tag "Preset plist spec"))
   :group 'gptel-agent)
 
+(defcustom gptel-agent-task-buffer-function #'gptel-agent-task-buffer
+  "Function used to create a subagent task buffer.
+Called with the parent buffer as its sole argument.  It must return a
+live buffer suitable for a gptel conversation.  The task runner applies
+the agent preset and inserts the task prompt into the returned buffer."
+  :type 'function
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-task-complete-hook nil
+  "Hook run once whenever a subagent returns a result to its parent.
+This includes successful completion, errors, and aborted tasks, but not
+intermediate tool turns or later conversations in the subagent buffer.
+Functions are called without arguments in the subagent buffer, with
+point at the response end, or at the request position if no response
+was inserted.  Point is restored afterward.
+
+Runs after `gptel-post-response-functions' and before the parent callback.
+Hook errors are reported without preventing delivery to the parent."
+  :type 'hook
+  :group 'gptel-agent)
+
 ;;; Tool use preview
 (defun gptel-agent--confirm-overlay (from to &optional no-hide)
   "Set up tool call preview overlay FROM TO.
@@ -1381,6 +1402,17 @@ the known skills as string ready to be included to the context."
 
 ;;; Task tool (sub-agent)
 
+(defun gptel-agent-task-buffer (parent-buffer)
+  "Create and return a new gptel buffer for a task from PARENT-BUFFER.
+Name it using the parent buffer's name and the next subagent number,
+with an additional suffix if needed to keep the name unique.
+This is the default for `gptel-agent-task-buffer-function'."
+  (gptel (generate-new-buffer-name
+          (format "*%s-subagent-%s*"
+                  (string-trim (buffer-name parent-buffer) "*" "*")
+                  (1+ (length (buffer-local-value
+                               'gptel-agent--task-buffers parent-buffer)))))))
+
 (defun gptel-agent--task-preview-setup (arg-values _info)
   "Preview setup for Agent.
 INFO is the tool call info plist.
@@ -1589,6 +1621,15 @@ its preview handlers run a second time."
         (let ((callback (plist-get context :main-cb)))
           (plist-put info :context nil)
           (setq gptel-agent--task-context nil)
+          (condition-case err
+              (save-excursion
+                (goto-char (or (plist-get info :tracking-marker)
+                               (plist-get info :position)))
+                (run-hooks 'gptel-agent-task-complete-hook))
+            (error
+             (display-warning 'gptel-agent
+                              (format "Task completion hook failed: %s"
+                                      (error-message-string err)))))
           (funcall callback
                    (pcase (gptel-fsm-state fsm)
                      ('ERRS (format "Error: Task failed: %S" (plist-get info :error)))
@@ -1662,12 +1703,7 @@ DESCRIPTION labels the task in the parent buffer."
          (parent-tracking-marker (plist-get info :tracking-marker))
          (parent-buffer (plist-get info :buffer))
          (directory default-directory)
-         (sub-agent-buffer
-          (gptel (generate-new-buffer-name
-                  (format "*%s-subagent-%s*"
-                          (string-trim (buffer-name parent-buffer) "*" "*")
-                          (1+ (length (buffer-local-value
-                                       'gptel-agent--task-buffers parent-buffer)))))))
+         (sub-agent-buffer (funcall gptel-agent-task-buffer-function parent-buffer))
          (task-overlay nil))
     (with-current-buffer parent-buffer
       (push sub-agent-buffer gptel-agent--task-buffers)
