@@ -84,6 +84,27 @@ parameters take precedence over this value."
                  (plist  :tag "Preset plist spec"))
   :group 'gptel-agent)
 
+(defcustom gptel-agent-task-buffer-function #'gptel-agent-task-buffer
+  "Function used to create a subagent task buffer.
+Called with the parent buffer as its sole argument.  It must return a
+live buffer suitable for a gptel conversation.  The task runner applies
+the agent preset and inserts the task prompt into the returned buffer."
+  :type 'function
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-task-complete-hook nil
+  "Hook run once whenever a subagent returns a result to its parent.
+This includes successful completion, errors, and aborted tasks, but not
+intermediate tool turns or later conversations in the subagent buffer.
+Functions are called without arguments in the subagent buffer, with
+point at the response end, or at the request position if no response
+was inserted.  Point is restored afterward.
+
+Runs after `gptel-post-response-functions' and before the parent callback.
+Hook errors are reported without preventing delivery to the parent."
+  :type 'hook
+  :group 'gptel-agent)
+
 ;;; Tool use preview
 (defun gptel-agent--confirm-overlay (from to &optional no-hide)
   "Set up tool call preview overlay FROM TO.
@@ -1380,15 +1401,17 @@ the known skills as string ready to be included to the context."
           (format "Could not load body of skill %s" skill))))))
 
 ;;; Task tool (sub-agent)
-(defvar gptel-agent-request--handlers
-  `((WAIT ,#'gptel-agent--indicate-wait
-          ,#'gptel--handle-wait)
-    (TPRE ,#'gptel--handle-pre-tool ,#'gptel--fsm-transition)
-    (TOOL ,#'gptel-agent--indicate-tool-call
-          ,#'gptel--handle-tool-use)
-    (TRET ,#'gptel--handle-post-tool
-          ,#'gptel--handle-tool-result))
-  "See `gptel-request--handlers'.")
+
+(defun gptel-agent-task-buffer (parent-buffer)
+  "Create and return a new gptel buffer for a task from PARENT-BUFFER.
+Name it using the parent buffer's name and the next subagent number,
+with an additional suffix if needed to keep the name unique.
+This is the default for `gptel-agent-task-buffer-function'."
+  (gptel (generate-new-buffer-name
+          (format "*%s-subagent-%s*"
+                  (string-trim (buffer-name parent-buffer) "*" "*")
+                  (1+ (length (buffer-local-value
+                               'gptel-agent--task-buffers parent-buffer)))))))
 
 (defun gptel-agent--task-preview-setup (arg-values _info)
   "Preview setup for Agent.
@@ -1413,7 +1436,7 @@ ARG-VALUES is a list: (type description prompt)"
 (defun gptel-agent--indicate-wait (fsm)
   "Display waiting indicator for agent task FSM."
   (when-let* ((info (gptel-fsm-info fsm))
-              (info-ov (plist-get info :context))
+              (info-ov (plist-get (plist-get info :context) :ov))
               (count (overlay-get info-ov 'count)))
     (run-at-time
      1.5 nil
@@ -1434,7 +1457,7 @@ ARG-VALUES is a list: (type description prompt)"
   "Display tool call indicator for agent task FSM."
   (when-let* ((info (gptel-fsm-info fsm))
               (tool-use (plist-get info :tool-use))
-              (ov (plist-get info :context)))
+              (ov (plist-get (plist-get info :context) :ov)))
     ;; Update overlay with tool calls
     (when (overlay-buffer ov)
       (let* ((task-msg (overlay-get ov 'msg))
@@ -1454,8 +1477,8 @@ ARG-VALUES is a list: (type description prompt)"
         (overlay-put ov 'count (+ info-count (length tool-use)))
         (overlay-put ov 'after-string new-info-msg)))))
 
-(defun gptel-agent--task-overlay (where &optional agent-type description)
-  "Create overlay for agent task at WHERE with AGENT-TYPE and DESCRIPTION."
+(defun gptel-agent--task-overlay (where &optional agent-type description buffer-name)
+  "Create overlay for agent task at WHERE with AGENT-TYPE, DESCRIPTION and BUFFER-NAME."
   (let* ((bounds                  ;where to place the overlay, handle edge cases
           (save-excursion
             (goto-char where)
@@ -1473,6 +1496,11 @@ ARG-VALUES is a list: (type description prompt)"
                (propertize (concat (capitalize agent-type) " Task: ")
                            'face 'font-lock-escape-face)
                (propertize (or description "(no description)") 'face 'font-lock-doc-face)
+               " "
+               (propertize (or (and buffer-name
+                                    (concat "(in: " buffer-name ")"))
+                               "(no buffer)")
+                           'face 'font-lock-bracket-face)
                (propertize
                 " " 'display
                 (if (and (display-graphic-p) (fboundp 'string-pixel-width))
@@ -1489,64 +1517,229 @@ ARG-VALUES is a list: (type description prompt)"
        (concat msg (propertize "Waiting..." 'face 'warning) "\n"
                gptel-agent--hrule)))))
 
+(defvar-local gptel-agent--task-buffers nil)
+(defvar-local gptel-agent--task-context nil)
+
+;; The subagent specific handlers (i.e., `gptel-agent--*' handlers
+;; below) will not do anything after the subagent has completed its
+;; task.
+(defvar gptel-agent-send--handlers
+  `((WAIT ,#'gptel-agent--update-info ,#'gptel-agent--indicate-wait
+          ,#'gptel--handle-wait ,#'gptel--update-wait)
+    (TYPE ,#'gptel--handle-pre-insert)
+    (ERRS ,#'gptel--handle-error ,#'gptel--fsm-last
+          ,#'gptel-agent--task-finish)
+    (TPRE ,#'gptel--handle-token-usage ,#'gptel--handle-pre-tool
+          ,#'gptel--fsm-transition)
+    (TOOL ,#'gptel-agent--indicate-tool-call ,#'gptel--update-tool-call
+          ,#'gptel--handle-tool-use ,#'gptel--update-tool-ask)
+    (TRET ,#'gptel-agent--task-clear-confirmations
+          ,#'gptel--handle-post-tool ,#'gptel--handle-tool-result)
+    (TSTR ,#'gptel--handle-tool-steer)
+    (DONE ,#'gptel--handle-post-insert ,#'gptel--fsm-last
+          ,#'gptel-agent--task-finish)
+    (ABRT ,#'gptel--handle-abort ,#'gptel-agent--task-finish))
+  "Send handlers with parent task indicators and subagent completion.")
+
+(defun gptel-agent--update-info (fsm)
+  "Update the FSM's info callback to use when applicable.
+
+The callback will be set to `gptel-agent--task-response-handler' when
+the parent is still expecting a result.
+
+When `gptel-agent--task-context' in the subagent's buffer is nil, the
+agent interactions are completed.  After which the buffer will be
+treated as a regular gptel buffer."
+  (let ((info (gptel-fsm-info fsm)))
+    (with-current-buffer (plist-get info :buffer)
+      (when gptel-agent--task-context
+        (plist-put info :callback #'gptel-agent--task-response-handler)
+        (plist-put info :context gptel-agent--task-context)))))
+
+(defun gptel-agent--task-clear-confirmations (fsm &optional core-overlay info)
+  "Remove the confirmation displays belonging to FSM.
+If FSM is nil use INFO to collect context.  When called as a preview
+teardown, CORE-OVERLAY is being cleaned up by core and must not have
+its preview handlers run a second time."
+  (let* ((context (plist-get (or (and fsm (gptel-fsm-info fsm))
+                                 info)
+                             :context))
+         (confirmations (plist-get context :confirmations)))
+    ;; Detach first: steering can reach TRET before core runs teardown.
+    (when context (plist-put context :confirmations nil))
+    (dolist (ov confirmations)
+      (unless (eq ov core-overlay)
+        (when (and (overlayp ov) (overlay-buffer ov))
+          (with-current-buffer (overlay-buffer ov)
+            (when-let* ((preview-handles (overlay-get ov 'previews)))
+              (dolist (func-to-handle preview-handles)
+                (when (car func-to-handle) (apply func-to-handle))))
+            (dolist (prompt-ov (overlay-get ov 'prompt))
+              (when-let* (((overlay-buffer prompt-ov))
+                          (inhibit-read-only t))
+                (delete-region (overlay-start prompt-ov)
+                               (overlay-end prompt-ov)))))
+          (delete-overlay ov))))))
+
+(defun gptel-agent--task-confirmation-action (action)
+  "Forward parent confirmation ACTION to the authoritative child."
+  (let* ((info (get-char-property (point) 'info))
+         (child (car (plist-get (plist-get info :context) :confirmations))))
+    (when (and child (overlay-buffer child))
+      (let ((calls (overlay-get child 'gptel-tool)))
+        (with-current-buffer (plist-get info :buffer)
+          (pcase action
+            ('accept (gptel--accept-tool-calls calls child))
+            ('cancel (gptel--reject-tool-calls calls child))
+            ('steer (gptel--steer-tool-calls calls child info))
+            ('inspect (gptel--inspect-tool-calls calls info child))))))))
+
+(defvar gptel-agent--task-confirmation-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map gptel-tool-call-actions-map)
+    (dolist (binding '((gptel--accept-tool-calls . accept)
+                       (gptel--reject-tool-calls . cancel)
+                       (gptel--steer-tool-calls . steer)
+                       (gptel--inspect-tool-calls . inspect)))
+      (let ((action (cdr binding)))
+        (define-key map (vector 'remap (car binding))
+          (lambda () (interactive)
+            (gptel-agent--task-confirmation-action action)))))
+    map)
+  "Parent overlay commands forwarding to the child confirmation.")
+
+(defun gptel-agent--task-finish (fsm)
+  "Return the result of terminal FSM to the parent exactly once."
+  (let* ((info (gptel-fsm-info fsm))
+         (context (plist-get info :context)))
+    (with-current-buffer (plist-get info :buffer)
+      (when (and (plist-get context :main-cb)
+                 (or (memq (gptel-fsm-state fsm) '(ERRS ABRT))
+                     (not (plist-get info :tool-use))))
+        (gptel-agent--task-clear-confirmations fsm)
+        (when-let* ((ov (plist-get context :ov))) (delete-overlay ov))
+        (let ((callback (plist-get context :main-cb)))
+          (plist-put info :context nil)
+          (setq gptel-agent--task-context nil)
+          (condition-case err
+              (save-excursion
+                (goto-char (or (plist-get info :tracking-marker)
+                               (plist-get info :position)))
+                (run-hooks 'gptel-agent-task-complete-hook))
+            (error
+             (display-warning 'gptel-agent
+                              (format "Task completion hook failed: %s"
+                                      (error-message-string err)))))
+          (funcall callback
+                   (pcase (gptel-fsm-state fsm)
+                     ('ERRS (format "Error: Task failed: %S" (plist-get info :error)))
+                     ('ABRT "Error: Task was aborted by the user.")
+                     (_ (concat (plist-get context :output-prefix)
+                                (plist-get context :output))))))))))
+
+(defun gptel-agent--task-response-handler (resp info &optional raw)
+  "The response handler for `gptel-agent--task'.
+See `gptel-request' for the values for RESP INFO.
+
+RAW is passed to `gptel-curl--stream-insert-response' or
+`gptel--insert-response' depending on how response is delivered."
+  (let* ((context (plist-get info :context))
+         (parent-buffer (plist-get context :parent-buffer)))
+    (with-current-buffer (plist-get info :buffer)
+      ;; KLUDGE: to prevent the last tool-result get included, checking raw
+      ;; FIXME: Is this the only case where raw is non-nil?
+      (unless (or raw (eq resp t))
+        ;; No need to send back reasoning and tool results blocks.
+        ;; Clearing output to avoid inbetween responses to also
+        ;; get accumulated.
+        (plist-put context :output
+                   (if (stringp resp)
+                       (concat (plist-get context :output) resp)
+                     "")))
+      (if (eq (car-safe resp) 'tool-call)
+          (let* ((child-prompt (gptel--display-tool-calls (cdr resp) info))
+                 (child-ov
+                  (and (overlayp child-prompt)
+                       (car (cl-remove-if-not
+                             (lambda (ov) (memq child-prompt (overlay-get ov 'prompt)))
+                             (overlays-at (overlay-start child-prompt)))))))
+            (when (and child-ov (buffer-live-p parent-buffer))
+              (let ((display-info (copy-sequence info)))
+                ;; Setup the info for the parent to create the overlay
+                ;; in the correct place.
+                (plist-put display-info :buffer parent-buffer)
+                (plist-put display-info :position (plist-get context :parent-position))
+                (plist-put display-info :tracking-marker (plist-get context :parent-tracking-marker))
+                (plist-put context :confirmations (list child-ov))
+                ;; Core actions, including inspection, tear down the mirror.
+                (overlay-put child-ov 'previews
+                             (nconc (overlay-get child-ov 'previews)
+                                    (list (list #'gptel-agent--task-clear-confirmations
+                                                nil child-ov info))))
+                ;; TODO: Handle to simultanious agents requesting tool confirmations.
+                (let* ((parent-prompt (gptel--display-tool-calls (cdr resp) display-info))
+                       (parent-ov
+                        (and (overlayp parent-prompt)
+                             (with-current-buffer parent-buffer
+                               (car (cl-remove-if-not
+                                     (lambda (ov)
+                                       (memq parent-prompt (overlay-get ov 'prompt)))
+                                     (overlays-at (overlay-start parent-prompt))))))))
+                  (when parent-ov
+                    ;; Actions must update the child request, not its display copy.
+                    (overlay-put parent-ov 'info info)
+                    (overlay-put parent-ov 'keymap gptel-agent--task-confirmation-map)
+                    (plist-put context :confirmations (list child-ov parent-ov)))))))
+        (funcall (if (plist-get info :stream)
+                     #'gptel-curl--stream-insert-response
+                   #'gptel--insert-response)
+                 resp info raw)))))
+
 (defun gptel-agent--task (main-cb agent-type description prompt)
-  "Call a gptel agent to do specific compound tasks.
-
-MAIN-CB is the main callback to return a value to the main loop.
-AGENT-TYPE is the name of the agent.
-DESCRIPTION is a short description of the task.
-PROMPT is the detailed prompt instructing the agent on what is required."
-  (gptel-with-preset
-      (nconc (list :include-reasoning nil
-                   :use-tools t
-                   :context nil)       ;Can be overriden by agent
-              (and gptel-agent-preset
-                   (copy-sequence
-                    (cl-etypecase gptel-agent-preset
-                      (symbol (gptel-get-preset gptel-agent-preset))
-                      (plist gptel-agent-preset))))
-              (cdr (assoc agent-type gptel-agent--agents)))
-    (let* ((info (gptel-fsm-info gptel--fsm-last))
-           (where (or (plist-get info :tracking-marker)
-                      (plist-get info :position)))
-           (partial (format "%s result for task: %s\n\n"
-                            (capitalize agent-type) description)))
-      (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
-      (gptel-request prompt
-        :context (gptel-agent--task-overlay where agent-type description)
-        :fsm (gptel-make-fsm :table gptel-send--transitions
-                             :handlers gptel-agent-request--handlers)
-        :transforms (list #'gptel--transform-add-context)
-        :callback
-        (lambda (resp info)
-          (let ((ov (plist-get info :context)))
-            (pcase resp
-              ('nil
-               (delete-overlay ov)
-               (funcall main-cb
-                        (format "Error: Task %s could not finish task \"%s\". \
-
-Error details: %S"
-                                agent-type description (plist-get info :error))))
-              (`(tool-call . ,calls)
-               (unless (plist-get info :tracking-marker)
-                 (plist-put info :tracking-marker where))
-               (gptel--display-tool-calls calls info))
-              ((pred stringp)
-               (setq partial (concat partial resp))
-               ;; If tool use is pending, the agent isn't done, so we just
-               ;; accumulate output without printing it.  We print at the end.
-               (unless (plist-get info :tool-use)
-                 (delete-overlay ov)
-                 (when-let* ((transformer (plist-get info :transformer)))
-                   (setq partial (funcall transformer partial)))
-                 (funcall main-cb partial)))
-              ('abort
-               (delete-overlay ov)
-               (funcall main-cb
-                        (format "Error: Task \"%s\" was aborted by the user. \
-%s could not finish."
-                                description agent-type))))))))))
+  "Run PROMPT as AGENT-TYPE in a chat buffer and return it through MAIN-CB.
+DESCRIPTION labels the task in the parent buffer."
+  (let* ((info (gptel-fsm-info gptel--fsm-last))
+         (parent-position (plist-get info :position))
+         (parent-tracking-marker (plist-get info :tracking-marker))
+         (parent-buffer (plist-get info :buffer))
+         (directory default-directory)
+         (sub-agent-buffer (funcall gptel-agent-task-buffer-function parent-buffer))
+         (task-overlay nil))
+    (with-current-buffer parent-buffer
+      (push sub-agent-buffer gptel-agent--task-buffers)
+      (gptel--update-status " Calling Agent..." 'font-lock-escape-face))
+    ;; Setup subagent buffer and send request
+    ;; Setting up to use `gptel-send' so the subagent buffer can be
+    ;; used like a regular gptel buffer if request failed.
+    (with-current-buffer sub-agent-buffer
+      (setq-local default-directory directory)
+      (gptel--apply-preset (append (list :include-reasoning nil :use-tools t :context nil)
+                                   (and gptel-agent-preset
+                                        (cl-etypecase gptel-agent-preset
+                                          (symbol (gptel-get-preset gptel-agent-preset))
+                                          (plist gptel-agent-preset)))
+                                   (cdr (assoc agent-type gptel-agent--agents)))
+                           (lambda (symbol value) (set (make-local-variable symbol) value)))
+      (let ((model gptel-model))
+        (setq task-overlay
+              (with-current-buffer parent-buffer
+                (let ((gptel-model model))
+                  (gptel-agent--task-overlay
+                   (or parent-tracking-marker parent-position) agent-type description (buffer-name sub-agent-buffer))))))
+      (goto-char (point-max))
+      (insert prompt)
+      (setq-local gptel-send--handlers (copy-tree gptel-agent-send--handlers)
+                  gptel-agent--task-context
+                  (list :ov task-overlay
+                        :main-cb main-cb
+                        :parent-buffer parent-buffer
+                        :parent-position parent-position
+                        :parent-tracking-marker parent-tracking-marker
+                        :output ""
+                        :output-prefix
+                        (format "%s result for task: %s\n\n" (capitalize agent-type) description)))
+      ;; context and callback get set in `gptel-agent--update-info'
+      (gptel-send nil))))
 
 ;;; Register tool call preview functions
 
