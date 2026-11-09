@@ -1445,8 +1445,8 @@ ARG-VALUES is a list: (type description prompt)"
         (overlay-put ov 'count (+ info-count (length tool-use)))
         (overlay-put ov 'after-string new-info-msg)))))
 
-(defun gptel-agent--task-overlay (where &optional agent-type description)
-  "Create overlay for agent task at WHERE with AGENT-TYPE and DESCRIPTION."
+(defun gptel-agent--task-overlay (where &optional agent-type description buffer-name)
+  "Create overlay for agent task at WHERE with AGENT-TYPE, DESCRIPTION and BUFFER-NAME."
   (let* ((bounds                  ;where to place the overlay, handle edge cases
           (save-excursion
             (goto-char where)
@@ -1464,6 +1464,11 @@ ARG-VALUES is a list: (type description prompt)"
                (propertize (concat (capitalize agent-type) " Task: ")
                            'face 'font-lock-escape-face)
                (propertize (or description "(no description)") 'face 'font-lock-doc-face)
+               " "
+               (propertize (or (and buffer-name
+                                    (concat "(in: " buffer-name ")"))
+                               "(no buffer)")
+                           'face 'font-lock-bracket-face)
                (propertize
                 " " 'display
                 (if (and (display-graphic-p) (fboundp 'string-pixel-width))
@@ -1684,7 +1689,7 @@ DESCRIPTION labels the task in the parent buffer."
               (with-current-buffer parent-buffer
                 (let ((gptel-model model))
                   (gptel-agent--task-overlay
-                   (or parent-tracking-marker parent-position) agent-type description)))))
+                   (or parent-tracking-marker parent-position) agent-type description (buffer-name sub-agent-buffer))))))
       (goto-char (point-max))
       (insert prompt)
       (setq-local gptel-send--handlers (copy-tree gptel-agent-send--handlers)
