@@ -205,40 +205,57 @@ Below the size threshold in KB, the file is read as usual."
 
 ;;;; Glob tool
 
-(defvar gptel-agent-test-glob-force-find nil
-  "If non-nil, `gptel-agent-test-glob-invoke' forces the find branch.")
+(defvar gptel-agent-test-glob-backend nil
+  "Backend forced by `gptel-agent-test-glob-invoke'.
+nil uses whatever `gptel-agent--glob' picks, `find' forces the find
+branch and `elisp' forces the `directory-files-recursively' fallback.")
 
 (defun gptel-agent-test-glob-invoke (pattern &optional depth path)
   "Call `gptel-agent--glob' with PATTERN, DEPTH and PATH.
-PATH defaults to `default-directory'.  If
-`gptel-agent-test-glob-force-find' is non-nil, stub `executable-find'
-so that \"tree\" resolves to nil, forcing the find code path."
+PATH defaults to `default-directory'.  Depending on
+`gptel-agent-test-glob-backend', stub `executable-find' so that only
+\"find\" resolves, or so that nothing resolves."
   (let ((path (or path default-directory)))
-    (if (and gptel-agent-test-glob-force-find
-             (executable-find "find" t))
-        (let ((find-path (executable-find "find" t)))
-          (cl-letf (((symbol-function 'executable-find)
-                     (lambda (command &optional _remote)
-                       (and (string= command "find") find-path))))
-            (gptel-agent--glob pattern path depth)))
-      (gptel-agent--glob pattern path depth))))
+    (pcase gptel-agent-test-glob-backend
+      ('find
+       (let ((find-path (executable-find "find" t)))
+         (cl-letf (((symbol-function 'executable-find)
+                    (lambda (command &optional _remote)
+                      (and (string= command "find") find-path))))
+           (gptel-agent--glob pattern path depth))))
+      ('elisp
+       (cl-letf (((symbol-function 'executable-find) #'ignore))
+         (gptel-agent--glob pattern path depth)))
+      (_ (gptel-agent--glob pattern path depth)))))
+
+(defun gptel-agent-test-glob-posix-p ()
+  "Return non-nil if `gptel-agent--glob' may use external programs."
+  (not (memq system-type '(windows-nt ms-dos))))
 
 (defmacro gptel-agent-test-deftest-glob (name docstring &rest body)
-  "Define ERT tests NAME-tree and NAME-find, both running BODY.
-Each variant skips itself when the corresponding executable is
-missing; the find variant additionally stubs `executable-find' to
-force the find branch of `gptel-agent--glob' even when `tree' is
-installed."
+  "Define ERT tests NAME-tree, NAME-find and NAME-elisp running BODY.
+The tree and find variants skip themselves when the corresponding
+executable is missing or on MS-Windows; the find variant stubs
+`executable-find' to force the find branch of `gptel-agent--glob'
+even when `tree' is installed.  The elisp variant stubs
+`executable-find' so that the `directory-files-recursively' fallback
+is used."
   (declare (indent 1) (doc-string 2))
   `(progn
      (ert-deftest ,(intern (concat (symbol-name name) "-tree")) ()
        ,docstring
-       (skip-unless (executable-find "tree"))
+       (skip-unless (and (gptel-agent-test-glob-posix-p)
+                         (executable-find "tree")))
        ,@body)
      (ert-deftest ,(intern (concat (symbol-name name) "-find")) ()
        ,(concat docstring "  Exercises the `find' branch.")
-       (skip-unless (executable-find "find"))
-       (let ((gptel-agent-test-glob-force-find t))
+       (skip-unless (and (gptel-agent-test-glob-posix-p)
+                         (executable-find "find")))
+       (let ((gptel-agent-test-glob-backend 'find))
+         ,@body))
+     (ert-deftest ,(intern (concat (symbol-name name) "-elisp")) ()
+       ,(concat docstring "  Exercises the Emacs Lisp fallback.")
+       (let ((gptel-agent-test-glob-backend 'elisp))
          ,@body))))
 
 (defun gptel-agent-test-glob-fixture ()
@@ -335,22 +352,19 @@ The path argument is rejected before any external program runs."
 (gptel-agent-test-deftest-glob gptel-agent-test-glob-truncates-large-output
   "Test that output over 20000 chars is truncated with a notice."
   (gptel-agent-test-with-temp-dir
-    (dotimes (i 80)
+    ;; Keep names short enough for MS-Windows' 260-char path limit.
+    (dotimes (i 250)
       (write-region "" nil (expand-file-name
-                            (format "%s%d.txt" (make-string 240 ?a) i))))
+                            (format "%s%d.txt" (make-string 100 ?a) i))))
     (let ((result (gptel-agent-test-glob-invoke "*")))
       (should (string-match-p "results too large" result))
       (should (string-match-p "Stored in:" result)))))
 
 (ert-deftest gptel-agent-test-glob-branches-agree ()
-  "Test that the tree and find branches return the same file set."
-  (skip-unless (and (executable-find "tree") (executable-find "find")))
+  "Test that the tree, find and elisp branches return the same file set."
   (gptel-agent-test-with-temp-dir
     (gptel-agent-test-glob-fixture)
-    (let* ((tree-result (gptel-agent-test-glob-invoke "*.txt"))
-           (find-result (let ((gptel-agent-test-glob-force-find t))
-                          (gptel-agent-test-glob-invoke "*.txt")))
-           (paths
+    (let* ((paths
             (lambda (result)
               (sort
                (delq nil (mapcar
@@ -359,9 +373,38 @@ The path argument is rejected before any external program runs."
                                  (file-regular-p line)
                                  line))
                           (split-string result "\n")))
-               #'string<))))
-      (should (equal (funcall paths tree-result)
-                     (funcall paths find-result))))))
+               #'string<)))
+           (results
+            (delq nil
+                  (mapcar
+                   (lambda (backend)
+                     (when (or (eq backend 'elisp)
+                               (and (gptel-agent-test-glob-posix-p)
+                                    (executable-find
+                                     (if backend (symbol-name backend) "tree"))))
+                       (let ((gptel-agent-test-glob-backend backend))
+                         (funcall paths
+                                  (gptel-agent-test-glob-invoke "*.txt")))))
+                   '(nil find elisp)))))
+      (skip-unless (cdr results))
+      (dolist (result (cdr results))
+        (should (equal (car results) result))))))
+
+(ert-deftest gptel-agent-test-glob-windows-skips-system-tools ()
+  "Test that MS-Windows `tree.com' and `find.exe' are never run.
+On local MS-Windows directories, `gptel-agent--glob' must use the
+Emacs Lisp fallback even when `tree' and `find' are on the PATH."
+  (gptel-agent-test-with-temp-dir
+    (gptel-agent-test-glob-fixture)
+    (let ((system-type 'windows-nt))
+      (cl-letf (((symbol-function 'executable-find)
+                 (lambda (command &optional _remote)
+                   (concat "C:/Windows/System32/" command ".exe")))
+                ((symbol-function 'process-file)
+                 (lambda (&rest _) (error "process-file called"))))
+        (let ((result (gptel-agent--glob "*.md" default-directory)))
+          (should (string-match-p (regexp-quote (expand-file-name "b.md"))
+                                  result)))))))
 
 ;;;; Edit tool
 

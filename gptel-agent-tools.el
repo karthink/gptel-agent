@@ -1039,16 +1039,55 @@ MAX-LINES is the number of lines to keep, defaulting to 50."
       (insert (format "\n\n[Use Read tool with file_path=\"%s\" to view full results]"
                       temp-file)))))
 
+(defun gptel-agent--glob-elisp (pattern dir depth)
+  "Insert files under DIR whose basename matches PATTERN.
+
+This is the fallback used by `gptel-agent--glob' when no usable
+`tree' or `find' executable is available, e.g. on MS-Windows where
+`tree.com' and `find.exe' are unrelated programs.
+
+PATTERN is a case-insensitive glob.  DEPTH, when a natural number,
+limits recursion as `find -maxdepth' does.  Hidden files are included
+and .git directories are pruned.  Files are inserted into the current
+buffer, one per line, newest first."
+  (let* ((root (file-name-as-directory dir))
+         (root-depth (length (file-name-split (directory-file-name root))))
+         (case-fold-search t)
+         (files
+          (directory-files-recursively
+           root (wildcard-to-regexp pattern) nil
+           (lambda (subdir)
+             (and (not (string= (file-name-nondirectory subdir) ".git"))
+                  (file-accessible-directory-p subdir)
+                  (or (not (natnump depth))
+                      ;; SUBDIR is at depth N relative to ROOT; its
+                      ;; files are at depth N + 1.
+                      (< (- (length (file-name-split subdir)) root-depth)
+                         depth))))))
+         (dated (mapcar (lambda (file)
+                          (cons (file-attribute-modification-time
+                                 (file-attributes file))
+                                file))
+                        (unless (and (natnump depth) (< depth 1))
+                          (cl-remove ".git" files
+                                     :key #'file-name-nondirectory
+                                     :test #'string=)))))
+    (dolist (entry (sort dated (lambda (a b) (time-less-p (car b) (car a)))))
+      (insert (file-local-name (cdr entry)) "\n"))))
+
 (defun gptel-agent--glob (pattern &optional path depth)
-  "Find files matching PATTERN using `tree' or GNU find.
+  "Find files matching PATTERN using `tree', GNU find or Emacs Lisp.
 
 PATTERN is a case-insensitive glob pattern applied to file
 basenames, like \"*.el\".
 PATH is the optional directory to search (defaults to current directory).
 DEPTH limits recursion depth when provided (non-negative integer).
 
-Uses `tree' when available, falling back to GNU find.  Hidden files
-and directories are included; .git directories are skipped.
+Uses `tree' when available, falling back to GNU find, and then to
+`directory-files-recursively'.  The external programs are not used
+on local MS-Windows directories, where `tree' and `find' are
+unrelated system utilities.  Hidden files and directories are
+included; .git directories are skipped.
 
 Returns a string listing matching files with full paths, sorted by
 modification time, newest first.  If the output is too large (>20000
@@ -1056,56 +1095,58 @@ chars), it writes the full results to a temporary file and returns a
 truncated version with instructions to use `Read' for the full
 contents.
 
-Raises an error if PATTERN is empty, PATH is not readable, or
-neither the `tree' nor the `find' executable is found."
+Raises an error if PATTERN is empty or PATH is not readable."
   (when (string-empty-p pattern)
     (error "Error: pattern must not be empty"))
   (if path
       (unless (and (file-readable-p path) (file-directory-p path))
         (error "Error: path %s is not readable" path))
     (setq path "."))
-  (let* ((use-tree (executable-find "tree" t))
+  (let* ((full-path (expand-file-name path))
+         (posix-tools (not (and (memq system-type '(windows-nt ms-dos))
+                                (not (file-remote-p full-path)))))
+         (use-tree (and posix-tools (executable-find "tree" t)))
          (program (cond (use-tree "tree")
-                        ((executable-find "find" t) "find")
-                        (t (error "Error: Neither `tree` nor `find` \
-executable found.  This tool cannot be used"))))
-         (full-path (expand-file-name path)))
+                        ((and posix-tools (executable-find "find" t))
+                         "find"))))
     (with-temp-buffer
-      (let* ((local-path (file-local-name full-path))
-             (args
-              (if use-tree
-                  (let ((tree-args (list "-a" "-r" "-l" "-f" "-i" "-I" ".git"
-                                         "--sort=mtime" "--ignore-case"
-                                         "--prune" "-P" pattern local-path)))
-                    (if (natnump depth)
-                        (nconc tree-args
-                               (list "-L" (number-to-string depth)))
-                      tree-args))
-                (nconc
-                 (list "-L" local-path)
-                 (and (natnump depth)
-                      (list "-maxdepth" (number-to-string depth)))
-                 (list "(" "-name" ".git" ")" "-prune"
-                       "-o" "(" "-type" "f" "-iname" pattern
-                       "-printf" "%30T@\t%p\n" ")"))))
-             (exit-code (apply #'process-file program nil t nil args)))
-        (unless use-tree
-          ;; find prints "%30T@\t%p\n" per match: drop diagnostics that
-          ;; leaked into stdout, sort by mtime newest first (the padded
-          ;; timestamp makes a lexicographic sort equivalent to a
-          ;; numeric one), then strip the timestamp field.
-          (when (> (buffer-size) 0)
-            (keep-lines "^[ 0-9.]+\t" (point-min) (point-max))
-            (sort-lines t (point-min) (point-max))
+      (if (not program)
+          (gptel-agent--glob-elisp pattern full-path depth)
+        (let* ((local-path (file-local-name full-path))
+               (args
+                (if use-tree
+                    (let ((tree-args (list "-a" "-r" "-l" "-f" "-i" "-I" ".git"
+                                           "--sort=mtime" "--ignore-case"
+                                           "--prune" "-P" pattern local-path)))
+                      (if (natnump depth)
+                          (nconc tree-args
+                                 (list "-L" (number-to-string depth)))
+                        tree-args))
+                  (nconc
+                   (list "-L" local-path)
+                   (and (natnump depth)
+                        (list "-maxdepth" (number-to-string depth)))
+                   (list "(" "-name" ".git" ")" "-prune"
+                         "-o" "(" "-type" "f" "-iname" pattern
+                         "-printf" "%30T@\t%p\n" ")"))))
+               (exit-code (apply #'process-file program nil t nil args)))
+          (unless use-tree
+            ;; find prints "%30T@\t%p\n" per match: drop diagnostics that
+            ;; leaked into stdout, sort by mtime newest first (the padded
+            ;; timestamp makes a lexicographic sort equivalent to a
+            ;; numeric one), then strip the timestamp field.
+            (when (> (buffer-size) 0)
+              (keep-lines "^[ 0-9.]+\t" (point-min) (point-max))
+              (sort-lines t (point-min) (point-max))
+              (goto-char (point-min))
+              (while (re-search-forward "^[ 0-9.]+\t" nil t)
+                (replace-match ""))))
+          (when (/= exit-code 0)
             (goto-char (point-min))
-            (while (re-search-forward "^[ 0-9.]+\t" nil t)
-              (replace-match ""))))
-        (when (/= exit-code 0)
-          (goto-char (point-min))
-          (insert (format "Glob failed with exit code %d\n.STDOUT:\n\n"
-                          exit-code)))
-        (gptel-agent--truncate-buffer "glob")
-        (buffer-string)))))
+            (insert (format "Glob failed with exit code %d\n.STDOUT:\n\n"
+                            exit-code)))))
+      (gptel-agent--truncate-buffer "glob")
+      (buffer-string))))
 
 ;;;; Read files or directories
 (defun gptel-agent--read-file-lines (filename start-line end-line)
