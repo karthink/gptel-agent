@@ -198,6 +198,33 @@ Below the size threshold in KB, the file is read as usual."
     (should (string-match-p "deep\.txt\n1:needle here"
                             (gptel-agent--grep "needle" default-directory)))))
 
+(ert-deftest gptel-agent-test-grep-non-utf-8-file ()
+  "Test that matches from non-UTF-8 files are decoded (issue #38).
+Uses git grep, which (like ripgrep, but unlike GNU grep in a UTF-8
+locale) outputs raw bytes for such files."
+  (skip-unless (executable-find "git"))
+  (gptel-agent-test-with-temp-dir
+    (should (zerop (call-process "git" nil nil nil "init" "-q")))
+    (let ((coding-system-for-write 'no-conversion))
+      (write-region "Ol\341\n" nil (expand-file-name "latin-1.txt"))
+      (write-region "\223\372\226\173\214\352 O\n" nil
+                    (expand-file-name "sjis.txt")))
+    (let ((result (gptel-agent--grep "O" default-directory)))
+      (should (string-match-p "1:Olá" result))
+      (should (string-match-p "1:日本語 O" result))
+      (should (json-serialize (vector result))))))
+
+;;;; Output sanitization
+
+(ert-deftest gptel-agent-test-sanitize-raw-bytes ()
+  "Test that raw bytes are decoded line by line, keeping valid text."
+  (with-temp-buffer
+    (insert "Ol" (unibyte-char-to-multibyte #xe1) "\n"
+            "café " (unibyte-char-to-multibyte #xff) "\n"
+            "plain été\n")
+    (should-not (gptel-agent--sanitize-buffer "Test"))
+    (should (equal (buffer-string) "Olá\ncafé ÿ\nplain été\n"))))
+
 (ert-deftest gptel-agent-test-grep-unreadable-path ()
   "Test that grepping a nonexistent path signals an error."
   (gptel-agent-test-with-temp-dir

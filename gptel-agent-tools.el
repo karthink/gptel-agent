@@ -182,6 +182,44 @@ properties persist through refontification."
             (setq pos (or next (1- (point-max))))))))))
 
 ;;; System tools
+(defun gptel-agent--decode-raw-bytes ()
+  "Decode raw bytes (eight-bit chars) in the current buffer, in place.
+
+Tool output such as grep's may combine text from files in different
+encodings, so each line containing raw bytes is decoded separately,
+with its coding system detected.  On lines that also contain properly
+decoded non-ASCII text, only the runs of raw bytes are decoded.  Any
+bytes that still cannot be decoded are replaced with U+FFFD.
+
+Return non-nil if some bytes had to be replaced."
+  (let ((replaced nil))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "[^[:ascii:]]" nil t)
+        (let* ((beg (line-beginning-position))
+               (end (line-end-position))
+               (mixed (save-excursion
+                        (goto-char beg)
+                        (re-search-forward "[^[:ascii:]\x3fff80-\x3fffff]"
+                                           end t)))
+               (re (if mixed "[\x3fff80-\x3fffff]+" ".+")))
+          (save-restriction
+            (narrow-to-region beg end)
+            (goto-char (point-min))
+            (while (re-search-forward re nil t)
+              (let* ((text (match-string-no-properties 0))
+                     (decoded (decode-coding-string
+                               (encode-coding-string text 'utf-8-emacs t)
+                               'undecided t)))
+                (unless (equal text decoded)
+                  (replace-match decoded t t))))
+            (goto-char (point-min))
+            (while (re-search-forward "[\x3fff80-\x3fffff]" nil t)
+              (setq replaced t)
+              (replace-match "\uFFFD" t t))
+            (goto-char (point-max))))))
+    replaced))
+
 (defun gptel-agent--sanitize-buffer (&optional tool-name)
   "Prepare current buffer for tool-result serialization, in place.
 
@@ -189,15 +227,22 @@ If the buffer contains a NUL byte (binary content), keep only the text
 head before it, followed by a banner with size and inspection hints.
 Return non-nil if binary content was found.
 
+Otherwise, decode any raw bytes (e.g. from files not encoded in UTF-8)
+using `gptel-agent--decode-raw-bytes', so the result can be serialized
+as JSON.
+
 TOOL-NAME is used to prefix the inserted notices."
   (save-excursion
     (goto-char (point-min))
     (skip-chars-forward "^\0")          ; C-level scan; also the truncate point
     (if (eobp)                          ; no NUL
         (prog1 nil
-          (when (memq 'eight-bit (find-charset-region (point-min) (point-max)))
+          (when (and (memq 'eight-bit
+                           (find-charset-region (point-min) (point-max)))
+                     (gptel-agent--decode-raw-bytes))
             (goto-char (point-min))
-            (insert (format "[%s: warning, undecodable bytes present]\n"
+            (insert (format "[%s: warning, undecodable bytes replaced \
+with U+FFFD]\n"
                             (or tool-name "gptel-agent")))))
       (let ((size (position-bytes (point-max))))
         (delete-region (min (point) (+ (point-min) 2000)) (point-max))
